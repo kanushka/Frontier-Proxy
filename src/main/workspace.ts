@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type {
   ActivityEvent, ParticipantRunInput, ParticipantRunResult, ParticipantRunner, ParticipantView, ProviderConfig, ProviderRuntime,
-  Workspace, WorkspaceMessage, WorkspaceParticipant, WorkspaceStreamEvent, WorkspaceTurn, WorkspaceTurnStatus, WorkspaceView
+  VerificationReport, Workspace, WorkspaceMessage, WorkspaceParticipant, WorkspaceStreamEvent, WorkspaceTurn, WorkspaceTurnStatus, WorkspaceView
 } from '../shared/types'
 import { isValidHandle, normalizeHandle, parseMentions } from '../shared/mentions'
 import { activeSessions, sessionBlocked } from '../shared/sessions'
@@ -47,6 +47,9 @@ export interface WorkspaceRuntimeDeps {
   releaseProviderSlot(providerId: string): void
   persist(): void // ask the host to save + emit a snapshot
   emitStream(event: WorkspaceStreamEvent): void
+  // Run the repo's own checks against a writing turn's worktree. Injected like every
+  // other host capability so workspace.ts still imports nothing from engine.ts (ADR D10).
+  verify?(workdir: string, signal: AbortSignal): Promise<VerificationReport | undefined>
 }
 
 // A pluggable fan-out shape so a future `sequential` strategy (each participant sees
@@ -251,6 +254,10 @@ export class WorkspaceRuntime {
           const result = await this.deps.runner.run(input)
           const status = this.applyResult(turn, result, controller)
           if (turn.branch && status === 'completed') turn.committed = await commitWorktree(workdir, `Frontier workspace: ${participant.name} replying to ${trigger.text.slice(0, 60)}`)
+          // Same rule as an orchestrated subtask: only a turn that actually committed
+          // gets checked, so a participant that only answered a question does not pay
+          // for the repo's test suite.
+          if (turn.committed) turn.verification = await this.deps.verify?.(workdir, controller.signal)
           if (status === 'completed' && turn.output.trim()) this.appendAgentMessage(workspace, participant, turn.output)
         } finally {
           if (workdir !== workspace.cwd) await removeWorktree(workspace.cwd, workdir)

@@ -2,7 +2,7 @@ import './styles.css'
 import { renderMarkdown } from './markdown'
 import { highlightSourceLine, parseUnifiedDiff } from './syntax'
 import { handleWorkspaceStream, renderWorkspaceView } from './workspace'
-import type { AppSnapshot, BranchRepo, ChatContextItem, ControlPlaneProfile, ConversationTurn, McpServerConfig, McpTransport, ProxyTask, RoutingCandidate, SelectedImage, SessionInfo, SkillCatalog, SubTask, TaskBranch, TaskFileContent, TaskWorkspaceSnapshot, WorkspaceEntry } from '../../shared/types'
+import type { AppSnapshot, BranchRepo, ChatContextItem, ControlPlaneProfile, ConversationTurn, McpServerConfig, McpTransport, ProxyTask, RoutingCandidate, SelectedImage, SessionInfo, SkillCatalog, SubTask, TaskBranch, TaskFileContent, TaskWorkspaceSnapshot, UsageDay, VerificationReport, WorkspaceEntry } from '../../shared/types'
 import { activeSessions, sessionBlocked, sessionResetAt, sessionStatusNote, sessionWindowElapsedPercent, sessionWindowLabel, sessionWindowPercent } from '../../shared/sessions'
 
 let snapshot: AppSnapshot
@@ -413,6 +413,16 @@ function taskKindLabel(task: ProxyTask): string {
   return task.bench ? 'Comparison' : task.orchestrated ? 'Split & delegate' : 'Single agent'
 }
 
+// A verification report in one chip. "not run" is deliberately distinct from
+// "passed": a repo with no detected checks has proved nothing about the branch.
+function verificationChip(verification?: VerificationReport): HTMLElement | undefined {
+  if (!verification) return undefined
+  if (!verification.ran) return element('span', 'check-chip none', 'no checks detected')
+  const failed = verification.checks.filter((check) => !check.ok)
+  return element('span', `check-chip ${failed.length ? 'fail' : 'pass'}`,
+    failed.length ? `checks failed: ${failed.map((check) => check.name).join(', ')}` : `checks passed: ${verification.checks.map((check) => check.name).join(', ')}`)
+}
+
 function element(tag: string, className?: string, text?: string): HTMLElement {
   const node = document.createElement(tag)
   if (className) node.className = className
@@ -633,6 +643,22 @@ function laneCard(task: ProxyTask, lane: SubTask, columns: boolean): HTMLElement
   identity.append(element('span', `task-state-dot ${lane.status}`), element('strong', undefined, lane.title))
   head.append(identity, element('span', 'lane-meta', [lane.model, lane.status].filter(Boolean).join(' · ')))
   card.append(head)
+
+  // Everything on this row is measured, never judged: how big the change was,
+  // how long it took, what it spent, and whether the repo's own checks passed.
+  const elapsed = lane.startedAt && lane.finishedAt ? Date.parse(lane.finishedAt) - Date.parse(lane.startedAt) : undefined
+  const measures = [
+    lane.filesTouched ? `${lane.filesTouched} file${lane.filesTouched === 1 ? '' : 's'} +${lane.additions ?? 0} −${lane.deletions ?? 0}` : undefined,
+    elapsed !== undefined ? formatDuration(elapsed) : undefined,
+    lane.usageInputTokens || lane.usageOutputTokens ? `${formatNumber((lane.usageInputTokens ?? 0) + (lane.usageOutputTokens ?? 0))} tokens` : undefined
+  ].filter(Boolean) as string[]
+  const chip = verificationChip(lane.verification)
+  if (measures.length || chip) {
+    const score = element('div', 'lane-score')
+    for (const measure of measures) score.append(element('span', 'lane-measure', measure))
+    if (chip) score.append(chip)
+    card.append(score)
+  }
 
   if (lane.branch) {
     const branch = element('button', 'lane-branch') as HTMLButtonElement
@@ -1148,6 +1174,44 @@ function languageFor(path: string): string {
   return LANGUAGE_BY_EXTENSION[path.split('.').pop()?.toLowerCase() ?? ''] ?? 'plaintext'
 }
 
+// The checks that ran against this branch's worktree, and why the merge button
+// should or should not be trusted. Merging is never blocked on them: the checks
+// are information for the person deciding, not a gate Frontier enforces.
+function renderReviewChecks(branch: TaskBranch): void {
+  const host = byId('review-checks')
+  const verification = branch.verification
+  if (!verification) {
+    host.replaceChildren()
+    host.hidden = true
+    return
+  }
+  host.hidden = false
+  const head = element('div', 'review-checks-head')
+  head.append(
+    element('strong', undefined, 'Checks on this branch'),
+    verificationChip(verification) ?? element('span')
+  )
+  const nodes: HTMLElement[] = [head]
+  if (!verification.ran) {
+    nodes.push(element('div', 'review-checks-empty', 'Frontier found no test, lint, or typecheck command in this project, so nothing was run. Add one in Settings → Verification to check future branches.'))
+  } else {
+    for (const check of verification.checks) {
+      const row = element('details', `review-check ${check.ok ? 'pass' : 'fail'}`)
+      const summary = element('summary')
+      summary.append(
+        element('span', `check-dot ${check.ok ? 'pass' : 'fail'}`),
+        element('strong', undefined, check.name),
+        element('code', undefined, check.command),
+        element('span', 'review-check-meta', `${check.timedOut ? 'timed out' : check.ok ? 'passed' : `exit ${check.exitCode ?? 1}`} · ${formatDuration(check.durationMs)}`)
+      )
+      row.append(summary)
+      if (check.output) row.append(element('pre', 'review-check-output', check.output))
+      nodes.push(row)
+    }
+  }
+  host.replaceChildren(...nodes)
+}
+
 function renderReview(): void {
   const list = byId('review-list')
   if (!reviewLoaded) {
@@ -1168,6 +1232,8 @@ function renderReview(): void {
         const additions = branch.files.reduce((total, file) => total + file.additions, 0)
         const deletions = branch.files.reduce((total, file) => total + file.deletions, 0)
         body.append(element('small', undefined, `${branch.files.length} file${branch.files.length === 1 ? '' : 's'} · +${additions} −${deletions} · ${timeAgo(branch.committedAt)}`))
+        const rowChip = verificationChip(branch.verification)
+        if (rowChip) body.append(rowChip)
         row.append(body)
         if (branch.merged) row.append(element('span', 'review-merged-chip', 'merged'))
         row.addEventListener('click', () => { reviewSelection = { cwd: branch.cwd, branch: branch.branch }; reviewFilePath = undefined; renderReview() })
@@ -1227,6 +1293,8 @@ function renderReview(): void {
   })
   controls.append(remove)
   actions.replaceChildren(controls)
+
+  renderReviewChecks(branch)
 
   if (!branch.files.length) {
     files.replaceChildren(element('div', 'detail-empty', 'This branch changes no files.'))
@@ -1315,6 +1383,14 @@ function renderProviders(): void {
     const identity = element('div', 'provider-name')
     const identityText = element('div')
     identityText.append(element('h3', undefined, provider.name), element('small', undefined, provider.kind.toUpperCase()))
+    // "Ready" only ever meant the binary was found. Say what the login probe
+    // found too, so a signed-out CLI is visible before a task dies on it.
+    const auth = provider.runtime.auth
+    if (auth && auth.state !== 'unknown') {
+      const badge = element('span', `auth-chip ${auth.state}`, auth.state === 'logged-in' ? 'signed in' : 'signed out')
+      badge.title = auth.detail ?? (auth.state === 'logged-out' ? 'This CLI is installed but not signed in.' : '')
+      identityText.append(badge)
+    }
     identity.append(element('span', `provider-dot ${provider.runtime.available ? 'online' : ''}`), identityText)
     const toggleLabel = document.createElement('label'); toggleLabel.className = 'switch'
     const toggle = document.createElement('input'); toggle.type = 'checkbox'; toggle.checked = provider.enabled
@@ -1428,6 +1504,47 @@ function usageGauge(label: string, percent: number | undefined, detail: string, 
   return node
 }
 
+// Fourteen days of tracked tokens as bars. Deliberately unlabelled per bar: this
+// is a shape, not a table — the exact numbers live in the stats above it.
+function usageHistory(history: UsageDay[], todayUsage: UsageDay): HTMLElement | undefined {
+  const days = [...history, todayUsage].slice(-14)
+  const totals = days.map((day) => (day.inputTokens + day.outputTokens) || (day.estimatedInputTokens + day.estimatedOutputTokens))
+  const peak = Math.max(...totals)
+  if (days.length < 2 || peak <= 0) return undefined
+  const section = element('div', 'usage-history')
+  section.append(element('div', 'usage-section-label', `Tracked tokens · last ${days.length} day${days.length === 1 ? '' : 's'}`))
+  const chart = element('div', 'usage-history-chart')
+  days.forEach((day, index) => {
+    const column = element('div', `usage-history-bar${index === days.length - 1 ? ' today' : ''}`)
+    const fill = element('div', 'usage-history-fill')
+    fill.style.height = `${Math.max(2, (totals[index] / peak) * 100)}%`
+    column.append(fill)
+    column.title = `${day.date} · ${formatNumber(totals[index])} tokens · ${day.tasks} run${day.tasks === 1 ? '' : 's'}`
+    chart.append(column)
+  })
+  section.append(chart)
+  return section
+}
+
+// Which models actually consumed the day's tokens. A CLI can switch models
+// mid-plan, so per-provider totals alone cannot answer "what is costing me this".
+function usageModels(usage: UsageDay): HTMLElement | undefined {
+  const entries = Object.entries(usage.models ?? {}).filter(([, value]) => value.inputTokens + value.outputTokens > 0)
+  if (!entries.length) return undefined
+  entries.sort((left, right) => (right[1].inputTokens + right[1].outputTokens) - (left[1].inputTokens + left[1].outputTokens))
+  const section = element('div', 'usage-models')
+  section.append(element('div', 'usage-section-label', 'By model today'))
+  for (const [model, value] of entries.slice(0, 5)) {
+    const row = element('div', 'usage-model-row')
+    row.append(
+      element('span', 'usage-model-name', model),
+      element('span', 'usage-model-tokens', `${formatNumber(value.inputTokens + value.outputTokens)} tokens${value.costUsd > 0 ? ` · ${formatCost(value.costUsd)}` : ''}`)
+    )
+    section.append(row)
+  }
+  return section
+}
+
 function renderUsage(): void {
   const grid = byId('usage-grid')
   grid.replaceChildren(...snapshot.providers.map((provider) => {
@@ -1443,7 +1560,8 @@ function renderUsage(): void {
 
     const stats = element('div', 'usage-stats')
     stats.append(
-      usageStat('Cost today', formatCost(usage.costUsd)),
+      // A CLI that never reports cost must not read as "this cost nothing".
+      usageStat('Cost today', usage.costReported ? formatCost(usage.costUsd) : 'not reported'),
       usageStat(hasActual ? 'Input tokens' : 'Input (est.)', formatNumber(hasActual ? usage.inputTokens : usage.estimatedInputTokens)),
       usageStat(hasActual ? 'Output tokens' : 'Output (est.)', formatNumber(hasActual ? usage.outputTokens : usage.estimatedOutputTokens)),
       usageStat('Tasks', String(usage.tasks))
@@ -1492,7 +1610,12 @@ function renderUsage(): void {
           ? `${sessions.length} usage window${sessions.length === 1 ? '' : 's'} in force${overage ? ` · overage ${overage.overageStatus?.replaceAll('_', ' ')}` : ''}.`
           : 'No plan window has been reported in this app session.'))
 
-    card.append(header, gauges, stats, footer)
+    card.append(header, gauges, stats)
+    const history = usageHistory(provider.runtime.history ?? [], usage)
+    if (history) card.append(history)
+    const models = usageModels(usage)
+    if (models) card.append(models)
+    card.append(footer)
     return card
   }))
 }
@@ -1648,6 +1771,14 @@ function renderSettings(): void {
   byId<HTMLInputElement>('cooldown-minutes').value = String(snapshot.settings.quotaCooldownMinutes)
   const memory = byId<HTMLTextAreaElement>('memory-input')
   if (document.activeElement !== memory) memory.value = snapshot.settings.memory ?? ''
+  const verification = snapshot.settings.verification
+  byId<HTMLInputElement>('verify-enabled').checked = verification?.enabled ?? true
+  const commands = byId<HTMLTextAreaElement>('verify-commands')
+  if (document.activeElement !== commands) commands.value = (verification?.commands ?? []).join('\n')
+  byId<HTMLInputElement>('verify-timeout').value = String(verification?.timeoutSeconds ?? 300)
+  byId<HTMLInputElement>('notify-enabled').checked = snapshot.settings.notifications?.enabled ?? true
+  byId<HTMLInputElement>('notify-unfocused').checked = snapshot.settings.notifications?.onlyWhenUnfocused ?? true
+  byId<HTMLInputElement>('learn-outcomes').checked = snapshot.settings.learnFromOutcomes !== false
 }
 
 // --- Control plane (Context & Tools) ---
@@ -2379,6 +2510,33 @@ byId('save-settings').addEventListener('click', async () => {
     })
     showToast('Scheduler settings saved')
   } catch (error) { reportError('Could not save scheduler settings', error) }
+})
+
+byId('save-verification').addEventListener('click', async () => {
+  const button = byId<HTMLButtonElement>('save-verification'); button.disabled = true
+  try {
+    await window.frontier.updateSettings({
+      verification: {
+        enabled: byId<HTMLInputElement>('verify-enabled').checked,
+        commands: textLines(byId<HTMLTextAreaElement>('verify-commands').value),
+        timeoutSeconds: Number(byId<HTMLInputElement>('verify-timeout').value) || 300
+      }
+    })
+    showToast('Verification settings saved')
+  } catch (error) { reportError('Could not save verification settings', error) } finally { button.disabled = false }
+})
+byId('save-feedback').addEventListener('click', async () => {
+  const button = byId<HTMLButtonElement>('save-feedback'); button.disabled = true
+  try {
+    await window.frontier.updateSettings({
+      notifications: {
+        enabled: byId<HTMLInputElement>('notify-enabled').checked,
+        onlyWhenUnfocused: byId<HTMLInputElement>('notify-unfocused').checked
+      },
+      learnFromOutcomes: byId<HTMLInputElement>('learn-outcomes').checked
+    })
+    showToast('Preferences saved')
+  } catch (error) { reportError('Could not save preferences', error) } finally { button.disabled = false }
 })
 
 byId<HTMLSelectElement>('provider-override').addEventListener('change', renderTaskModelOptions)

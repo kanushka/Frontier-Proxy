@@ -2,9 +2,10 @@ import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import { stat } from 'node:fs/promises'
 import { classifyTask, estimateTokens } from '../shared/classify'
+import { freshDefaults } from '../shared/defaults'
 import { activeSessions, sessionWindowExpired } from '../shared/sessions'
 import type {
-  ActivityEvent, AppSettings, AppSnapshot, BranchRepo, ChatContextItem, ContextSample, ControlPlaneProfile, ConversationTurn, CreateTaskInput, ProviderConfig, ProviderPatch, ProviderRuntime, ProxyTask, ResolvedSkill, SessionInfo, SkillCatalog, StreamEvent, SubTask, TaskAttempt, TaskFileContent, TaskType, TaskWorkspaceSnapshot, UsageSample, Workspace, WorkspaceEntry, WorkspaceStreamEvent, WorkspaceView
+  ActivityEvent, AppSettings, AppSnapshot, BranchRepo, ChatContextItem, ContextSample, ControlPlaneProfile, ConversationTurn, CreateTaskInput, OutcomeStats, ProviderConfig, ProviderPatch, ProviderRuntime, ProxyTask, ResolvedSkill, SessionInfo, SkillCatalog, StreamEvent, SubTask, TaskAttempt, TaskFileContent, TaskType, TaskWorkspaceSnapshot, UsageDay, UsageSample, VerificationReport, Workspace, WorkspaceEntry, WorkspaceStreamEvent, WorkspaceView
 } from '../shared/types'
 
 // Tool names that mutate files, mapped to the change action to record.
@@ -20,13 +21,14 @@ function recordFileChange(task: ProxyTask, event: ActivityEvent): void {
   const existing = (task.filesChanged ?? []).filter((change) => change.path !== path)
   task.filesChanged = [...existing, { path, action, at: event.at }].slice(-50)
 }
-import { buildProviderCommand, checkProvider, discoverModels, resolveTaskModel, runProvider, type ModelOwner } from './providers'
+import { buildProviderCommand, checkProvider, checkProviderAuth, discoverModels, resolveTaskModel, runProvider, type ModelOwner } from './providers'
 import { hydrateExecutablePath } from './env'
 import { discoverSkills, resolveSkills } from './skills'
 import { rankProviders, routeTask } from './router'
 import { buildPlannerPrompt, buildSynthesisPrompt, parsePlan } from './orchestrate'
 import { branchSlug, commitWorktree, createWorktree, isGitRepo, removeWorktree } from './worktree'
-import { branchFileDiff, deleteTaskBranch, listBranchInbox, mergeTaskBranch } from './branches'
+import { branchChangeStats, branchFileDiff, deleteTaskBranch, listBranchInbox, mergeTaskBranch } from './branches'
+import { verifyWorktree } from './verify'
 import { JsonStore } from './store'
 import { contextPrompt, listWorkspaceEntries, loadTaskFile, loadTaskWorkspace, validateChatContext } from './taskfiles'
 import type { McpAuthManager } from './mcp-auth'
@@ -35,8 +37,38 @@ function today(): string {
   return new Date().toLocaleDateString('en-CA')
 }
 
-function blankUsage(): ProviderRuntime['usage'] {
-  return { date: today(), tasks: 0, estimatedInputTokens: 0, estimatedOutputTokens: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, elapsedMs: 0 }
+// Finished days are kept so the Usage view can show a trend. A month is enough
+// to see a pattern without turning the state file into a time-series database.
+const USAGE_HISTORY_DAYS = 30
+
+// Streaming emits a snapshot per token, and a snapshot is a structuredClone of
+// every task and workspace. Coalescing them costs the UI nothing — streamed text
+// arrives on its own `stream` channel — and keeps a long run from cloning the
+// whole world thousands of times.
+const SNAPSHOT_INTERVAL_MS = 60
+
+function blankUsage(): UsageDay {
+  return { date: today(), tasks: 0, estimatedInputTokens: 0, estimatedOutputTokens: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, elapsedMs: 0, models: {}, costReported: false }
+}
+
+// Branch names can never contain a space (`isTaskBranch` rejects them), so a
+// space separates the two halves unambiguously.
+function branchKey(cwd: string, branch: string): string {
+  return `${cwd} ${branch}`
+}
+
+// "not run" is deliberately distinct from "passed": a repo with no detected
+// checks has proved nothing about the branch.
+export function benchChecks(lane: Pick<SubTask, 'verification'>): string {
+  const verification = lane.verification
+  if (!verification) return '—'
+  if (!verification.ran) return 'none detected'
+  const failed = verification.checks.filter((check) => !check.ok)
+  return failed.length ? `✗ ${failed.map((check) => check.name).join(', ')}` : `✓ ${verification.checks.map((check) => check.name).join(', ')}`
+}
+
+function blankOutcome(): OutcomeStats {
+  return { runs: 0, completed: 0, merged: 0, discarded: 0, verified: 0, verifyFailed: 0 }
 }
 
 function blankRuntime(): ProviderRuntime {
@@ -57,6 +89,8 @@ export class OrchestrationEngine extends EventEmitter {
   private readonly runtimes = new Map<string, ProviderRuntime>()
   private readonly controllers = new Map<string, AbortController>()
   private pumping = false
+  private snapshotTimer: ReturnType<typeof setTimeout> | undefined
+  private lastSnapshotAt = 0
   // Raw + renderer-facing workspace state, owned by WorkspaceRuntime (constructed in
   // index.ts, ADR D10) and mirrored here only so snapshot()/persistAndEmit() can expose
   // it through the same paths task state already uses.
@@ -69,6 +103,9 @@ export class OrchestrationEngine extends EventEmitter {
     const state = await this.store.load()
     this.settings = state.settings
     this.settings.skills ??= { disabledIds: [] }
+    this.settings.verification ??= freshDefaults().verification
+    this.settings.notifications ??= freshDefaults().notifications
+    this.settings.learnFromOutcomes ??= true
     this.tasks = state.tasks
     this.workspaces = state.workspaces ?? []
     await this.mcpAuth?.initialize()
@@ -76,7 +113,12 @@ export class OrchestrationEngine extends EventEmitter {
     for (const provider of this.settings.providers) {
       const runtime = blankRuntime()
       const persisted = state.providerRuntime?.[provider.id]
-      if (persisted?.usage?.date === today()) runtime.usage = persisted.usage
+      if (persisted?.usage?.date === today()) runtime.usage = { ...blankUsage(), ...persisted.usage }
+      // Yesterday's totals are history, not today's usage — keep them charted
+      // rather than dropping them at the rollover.
+      else if (persisted?.usage?.tasks) runtime.history = [...(persisted.history ?? []), persisted.usage].slice(-USAGE_HISTORY_DAYS)
+      runtime.history ??= persisted?.history
+      runtime.outcomes = persisted?.outcomes
       // A window persisted from an earlier run may have reset while the app was
       // closed; only windows still in force survive the reload.
       runtime.sessions = activeSessions({ ...blankRuntime(), sessions: persisted?.sessions, session: persisted?.session })
@@ -173,7 +215,8 @@ export class OrchestrationEngine extends EventEmitter {
     // limits still have to be valid at selection time.
     const selectable = rankProviders(
       { ...task, preferredProviderId: providerId, orchestrated: false },
-      [{ ...provider, runtime: { ...provider.runtime, running: 0 } }]
+      [{ ...provider, runtime: { ...provider.runtime, running: 0 } }],
+      this.routingOptions()
     ).length > 0
     if (!selectable) throw new Error(`${provider.name} is not currently available for this task.`)
 
@@ -227,21 +270,39 @@ export class OrchestrationEngine extends EventEmitter {
   // by the repo they belong to, so all subtask/turn work can be reviewed and merged
   // without leaving the app. Union of task and workspace cwds, de-duplicated (ADR D6).
   async listBranchInbox(): Promise<BranchRepo[]> {
-    return await listBranchInbox([...this.tasks.map((task) => task.cwd), ...this.workspaces.map((workspace) => workspace.cwd)])
+    const records = this.branchRecords()
+    return await listBranchInbox(
+      [...this.tasks.map((task) => task.cwd), ...this.workspaces.map((workspace) => workspace.cwd)],
+      (cwd, branch) => records.get(branchKey(cwd, branch))?.verification
+    )
   }
 
   async readBranchFile(cwd: string, branch: string, path: string): Promise<string> {
     return await branchFileDiff(cwd, branch, path)
   }
 
+  // Merging or discarding a branch is the strongest quality signal Frontier
+  // ever sees: a human looked at this agent's work and decided. Both verdicts
+  // are recorded against the agent that produced it and fed back into routing.
   async mergeBranch(cwd: string, branch: string): Promise<BranchRepo[]> {
     await mergeTaskBranch(cwd, branch)
+    await this.recordBranchVerdict(cwd, branch, 'merged')
     return await this.listBranchInbox()
   }
 
   async deleteBranch(cwd: string, branch: string): Promise<BranchRepo[]> {
+    // A branch already merged is being tidied up, not rejected.
+    const merged = (await this.listBranchInbox()).find((repo) => repo.cwd === cwd)?.branches.find((item) => item.branch === branch)?.merged
     await deleteTaskBranch(cwd, branch)
+    if (!merged) await this.recordBranchVerdict(cwd, branch, 'discarded')
     return await this.listBranchInbox()
+  }
+
+  private async recordBranchVerdict(cwd: string, branch: string, verdict: 'merged' | 'discarded'): Promise<void> {
+    const record = this.branchRecords().get(branchKey(cwd, branch))
+    if (!record?.providerId || !record.type) return
+    this.recordOutcome(record.providerId, record.type, { [verdict]: 1 })
+    await this.persistAndEmit()
   }
 
   async clearFinishedTasks(): Promise<void> {
@@ -267,6 +328,9 @@ export class OrchestrationEngine extends EventEmitter {
       runtime.available = health.available
       runtime.version = health.version
       runtime.models = await discoverModels(provider)
+      // "Ready" only ever meant "the binary exists". Probe the CLI's own session
+      // state too, so a logged-out Copilot is visible before a task fails on it.
+      runtime.auth = health.available ? await checkProviderAuth(provider).catch(() => undefined) : undefined
       runtime.lastCheckedAt = new Date().toISOString()
     }))
     this.emitSnapshot()
@@ -311,11 +375,21 @@ export class OrchestrationEngine extends EventEmitter {
     return this.snapshot()
   }
 
-  async updateSettings(changes: Partial<Pick<AppSettings, 'maxParallelTasks' | 'quotaCooldownMinutes' | 'memory' | 'skills'>>): Promise<AppSnapshot> {
+  async updateSettings(changes: Partial<Pick<AppSettings, 'maxParallelTasks' | 'quotaCooldownMinutes' | 'memory' | 'skills' | 'verification' | 'notifications' | 'learnFromOutcomes'>>): Promise<AppSnapshot> {
     if (changes.maxParallelTasks !== undefined) this.settings.maxParallelTasks = Math.max(1, Math.min(8, changes.maxParallelTasks))
     if (changes.quotaCooldownMinutes !== undefined) this.settings.quotaCooldownMinutes = Math.max(1, Math.min(1_440, changes.quotaCooldownMinutes))
     if (changes.memory !== undefined) this.settings.memory = changes.memory
     if (changes.skills !== undefined) this.settings.skills = { disabledIds: [...new Set(changes.skills.disabledIds ?? [])] }
+    if (changes.verification !== undefined) this.settings.verification = {
+      enabled: Boolean(changes.verification.enabled),
+      commands: (changes.verification.commands ?? []).map((line) => line.trim()).filter(Boolean),
+      timeoutSeconds: Math.max(10, Math.min(3_600, changes.verification.timeoutSeconds || 300))
+    }
+    if (changes.notifications !== undefined) this.settings.notifications = {
+      enabled: Boolean(changes.notifications.enabled),
+      onlyWhenUnfocused: Boolean(changes.notifications.onlyWhenUnfocused)
+    }
+    if (changes.learnFromOutcomes !== undefined) this.settings.learnFromOutcomes = Boolean(changes.learnFromOutcomes)
     await this.persistAndEmit()
     void this.pump()
     return this.snapshot()
@@ -416,6 +490,12 @@ export class OrchestrationEngine extends EventEmitter {
 
   frontierMemory(): string { return this.settings.memory ?? '' }
 
+  // WorkspaceRuntime runs the same checks against an edit-files turn's worktree.
+  // Exposed as an accessor rather than imported there (ADR D10).
+  async verifyRunWorktree(workdir: string, signal: AbortSignal): Promise<VerificationReport | undefined> {
+    return await verifyWorktree(workdir, { ...this.settings.verification, signal }).catch(() => undefined)
+  }
+
   private async pump(): Promise<void> {
     if (this.pumping) return
     this.pumping = true
@@ -479,7 +559,7 @@ export class OrchestrationEngine extends EventEmitter {
           recordFileChange(task, event)
           this.emitSnapshot()
         },
-        onUsage: (usage) => { this.applyUsage(runtime, usage, task) },
+        onUsage: (usage) => { this.applyUsage(runtime, usage, task, task.model ?? provider.model) },
         onContext: (context) => { contextReported = true; this.applyContext(task, provider, context) },
         onSession: (session) => { this.applySession(runtime, session) },
         onSessionId: (sessionId) => { task.sessionId = sessionId; task.sessionProviderId = provider.id }
@@ -532,9 +612,11 @@ export class OrchestrationEngine extends EventEmitter {
       task.error = controller.signal.aborted ? 'Task cancelled.' : 'No eligible provider could complete this task.'
       task.finishedAt = new Date().toISOString()
     }
+    this.recordRunOutcome(task.selectedProviderId, task.type, task.status)
     this.finalizeAssistantTurn(task)
     this.controllers.delete(task.id)
     await this.persistAndEmit()
+    this.notifyFinished(task)
     void this.pump()
   }
 
@@ -571,7 +653,8 @@ export class OrchestrationEngine extends EventEmitter {
     const requestedProviderId = task.continuationProviderId ?? task.selectedProviderId
     const routed = routeTask(
       { ...task, preferredProviderId: requestedProviderId, orchestrated: false },
-      this.snapshot().providers
+      this.snapshot().providers,
+      this.routingOptions()
     )
     const ranked = routed.ranked
     task.routing = routed.decision
@@ -629,7 +712,7 @@ export class OrchestrationEngine extends EventEmitter {
         onOutput: (chunk) => { task.output += chunk; task.estimatedOutputTokens = estimateTokens(task.output); this.emit('stream', { taskId: task.id, kind: 'output', data: chunk } satisfies StreamEvent); this.emitSnapshot() },
         onModel: (model) => { task.model = model; this.emitSnapshot() },
         onActivity: (event) => { task.activity = [...(task.activity ?? []), event].slice(-100); recordFileChange(task, event); this.emitSnapshot() },
-        onUsage: (usage) => { this.applyUsage(runtime, usage, task) },
+        onUsage: (usage) => { this.applyUsage(runtime, usage, task, task.model ?? provider.model) },
         onContext: (context) => { contextReported = true; this.applyContext(task, provider, context) },
         onSession: (session) => { this.applySession(runtime, session) },
         onSessionId: (sessionId) => { task.sessionId = sessionId; task.sessionProviderId = provider.id }
@@ -661,9 +744,11 @@ export class OrchestrationEngine extends EventEmitter {
       break
     }
     this.finishTask(task, controller.signal.aborted ? 'cancelled' : completed ? 'completed' : 'failed', completed ? undefined : controller.signal.aborted ? 'Task cancelled.' : finalError ?? 'No eligible provider could complete this turn.')
+    this.recordRunOutcome(task.selectedProviderId, task.type, task.status)
     this.finalizeAssistantTurn(task)
     this.controllers.delete(task.id)
     await this.persistAndEmit()
+    this.notifyFinished(task)
     void this.pump()
     return structuredClone(task)
   }
@@ -731,6 +816,7 @@ export class OrchestrationEngine extends EventEmitter {
       this.finalizeAssistantTurn(task)
       this.controllers.delete(task.id)
       await this.persistAndEmit()
+      this.notifyFinished(task)
       void this.pump()
     }
   }
@@ -762,7 +848,13 @@ export class OrchestrationEngine extends EventEmitter {
         try { workdir = await createWorktree(task.cwd, branch); lane.branch = branch } catch { /* share the cwd */ }
       }
       lane.status = 'running'
+      lane.startedAt = new Date().toISOString()
       runtime.running += 1
+      // Checks are local commands, not agent work — they must not keep occupying
+      // a subscription slot while the repo's test suite runs. Released as soon as
+      // the CLI itself is done, and idempotently again on the way out.
+      let releasedSlot = false
+      const releaseSlot = (): void => { if (!releasedSlot) { releasedSlot = true; runtime.running = Math.max(0, runtime.running - 1) } }
       const started = Date.now()
       this.emitSnapshot()
       try {
@@ -777,23 +869,39 @@ export class OrchestrationEngine extends EventEmitter {
             task.activity = [...(task.activity ?? []), { ...event, label: `${provider.name}: ${event.label}` }].slice(-100)
             this.emitSnapshot()
           },
-          onUsage: (usage) => { this.applyUsage(runtime, usage, task) },
+          onUsage: (usage) => {
+            lane.usageInputTokens = (lane.usageInputTokens ?? 0) + usage.inputTokens
+            lane.usageOutputTokens = (lane.usageOutputTokens ?? 0) + usage.outputTokens
+            this.applyUsage(runtime, usage, task, lane.model ?? provider.model)
+          },
           onSession: (session) => { this.applySession(runtime, session) }
         })
         if (!lane.output.trim()) lane.output = result.output
         if (!lane.model) lane.model = result.model ?? provider.model
         lane.status = controller.signal.aborted || result.failureKind === 'cancelled' ? 'cancelled' : result.ok ? 'completed' : 'failed'
         if (!result.ok && lane.status !== 'cancelled') lane.error = result.error
+        releaseSlot()
         if (lane.branch && result.ok) lane.committed = await commitWorktree(workdir, `Frontier bench (${provider.name}): ${task.prompt.slice(0, 60)}`)
+        // What makes a comparison decidable: run the repo's own checks against
+        // each lane's branch and measure the size of what it produced.
+        if (lane.branch && lane.committed) {
+          const verified = await this.verifyCommitted(task.cwd, workdir, lane.branch, controller.signal)
+          lane.verification = verified.verification
+          lane.filesTouched = verified.files
+          lane.additions = verified.additions
+          lane.deletions = verified.deletions
+        }
       } catch (error) {
         lane.status = 'failed'
         lane.error = error instanceof Error ? error.message : String(error)
       } finally {
-        runtime.running = Math.max(0, runtime.running - 1)
+        lane.finishedAt = new Date().toISOString()
+        releaseSlot()
         runtime.usage.tasks += 1
         runtime.usage.elapsedMs += Date.now() - started
         runtime.usage.estimatedInputTokens += estimateTokens(prompt)
         runtime.usage.estimatedOutputTokens += estimateTokens(lane.output)
+        this.recordRunOutcome(provider.id, lane.type, lane.status, lane.verification)
         if (workdir !== task.cwd) await removeWorktree(task.cwd, workdir)
         this.emitSnapshot()
       }
@@ -811,18 +919,34 @@ export class OrchestrationEngine extends EventEmitter {
     this.finalizeAssistantTurn(task)
     this.controllers.delete(task.id)
     await this.persistAndEmit()
+    this.notifyFinished(task)
     void this.pump()
   }
 
-  // A factual scoreboard built from what actually happened — no extra model call.
+  // A factual scoreboard built from what actually happened — no extra model call
+  // and no judge. Every column is something Frontier measured itself: whether the
+  // lane finished, whether the repo's own checks passed on its branch, how big
+  // the change was, how long it took, and what it spent.
   private benchSummary(lanes: SubTask[]): string {
+    const header = ['| Agent | Result | Checks | Diff | Time | Tokens | Branch |', '| --- | --- | --- | --- | --- | --- | --- |']
     const rows = lanes.map((lane) => {
-      const parts = [lane.model, lane.status]
-      if (lane.branch) parts.push(lane.committed ? `committed to \`${lane.branch}\`` : 'no file changes')
-      if (lane.error) parts.push(lane.error)
-      return `- **${lane.title}** — ${parts.filter(Boolean).join(' · ')}`
+      const elapsed = lane.startedAt && lane.finishedAt ? `${Math.round((Date.parse(lane.finishedAt) - Date.parse(lane.startedAt)) / 1000)}s` : '—'
+      const tokens = lane.usageInputTokens || lane.usageOutputTokens
+        ? `${(lane.usageInputTokens ?? 0).toLocaleString()} in / ${(lane.usageOutputTokens ?? 0).toLocaleString()} out`
+        : 'not reported'
+      const diff = lane.filesTouched ? `${lane.filesTouched} file${lane.filesTouched === 1 ? '' : 's'} +${lane.additions ?? 0}/−${lane.deletions ?? 0}` : 'no file changes'
+      return `| **${lane.title}**${lane.model ? `<br>${lane.model}` : ''} | ${lane.status} | ${benchChecks(lane)} | ${diff} | ${elapsed} | ${tokens} | ${lane.branch && lane.committed ? `\`${lane.branch}\`` : '—'} |`
     })
-    return [`### Head-to-head results`, '', ...rows].join('\n')
+    const errors = lanes.filter((lane) => lane.error).map((lane) => `- **${lane.title}** — ${lane.error}`)
+    return [
+      '### Head-to-head results',
+      '',
+      ...header,
+      ...rows,
+      ...(errors.length ? ['', '**Failures**', '', ...errors] : []),
+      '',
+      '_Checks are the repository\'s own test/lint/typecheck commands, run against each agent\'s branch. Frontier is not judging the answers._'
+    ].join('\n')
   }
 
   private async runSubtasks(task: ProxyTask, controller: AbortController): Promise<void> {
@@ -851,7 +975,7 @@ export class OrchestrationEngine extends EventEmitter {
         if (controller.signal.aborted) return
         subtask.status = 'failed'; subtask.error = 'No eligible provider.'; this.emitSnapshot(); return runNext()
       }
-      subtask.status = 'running'; subtask.providerId = provider.id; this.emitSnapshot()
+      subtask.status = 'running'; subtask.providerId = provider.id; subtask.startedAt = new Date().toISOString(); this.emitSnapshot()
       const workdir = worktrees.get(subtask.id) ?? task.cwd
       try {
         const result = await this.runOne(provider, subtask.prompt, task, controller, (text) => { subtask.output += text; this.emitSnapshot() }, workdir, subtask.type, imagePaths)
@@ -862,9 +986,20 @@ export class OrchestrationEngine extends EventEmitter {
         if (!result.ok) subtask.error = result.error
         // Commit the subtask's changes onto its branch before the worktree is torn down.
         if (worktrees.has(subtask.id) && result.ok) subtask.committed = await commitWorktree(workdir, `Frontier subtask: ${subtask.title}`)
+        // Then check the branch, so the Review inbox can say whether it is safe
+        // to merge rather than only what it changed.
+        if (subtask.branch && subtask.committed) {
+          const verified = await this.verifyCommitted(task.cwd, workdir, subtask.branch, controller.signal)
+          subtask.verification = verified.verification
+          subtask.filesTouched = verified.files
+          subtask.additions = verified.additions
+          subtask.deletions = verified.deletions
+        }
       } catch (error) {
         subtask.status = 'failed'; subtask.error = error instanceof Error ? error.message : String(error)
       }
+      subtask.finishedAt = new Date().toISOString()
+      this.recordRunOutcome(subtask.providerId, subtask.type, subtask.status, subtask.verification)
       this.emitSnapshot()
       return runNext()
     }
@@ -887,10 +1022,10 @@ export class OrchestrationEngine extends EventEmitter {
     for (;;) {
       if (controller.signal.aborted) return undefined
       const providers = this.snapshot().providers
-      const ranked = rankProviders(routing, providers)
+      const ranked = rankProviders(routing, providers, this.routingOptions())
       if (ranked.length) return this.settings.providers.find((item) => item.id === ranked[0].id)
       const idle = providers.map((provider) => ({ ...provider, runtime: { ...provider.runtime, running: 0 } }))
-      if (!rankProviders(routing, idle).length) return undefined
+      if (!rankProviders(routing, idle, this.routingOptions()).length) return undefined
       await new Promise((resolve) => setTimeout(resolve, 200))
     }
   }
@@ -906,7 +1041,7 @@ export class OrchestrationEngine extends EventEmitter {
     imagePaths: string[] = []
   ): Promise<{ output: string; model?: string; ok: boolean; error?: string; providerId: string }> {
     const routingTask = { ...task, type: routingType ?? task.type, preferredProviderId: undefined, orchestrated: false }
-    const ranked = rankProviders(routingTask, this.snapshot().providers)
+    const ranked = rankProviders(routingTask, this.snapshot().providers, this.routingOptions())
     const candidateIds = [...new Set([initialProvider.id, ...ranked.map((item) => item.id)])]
     let final: { output: string; model?: string; ok: boolean; error?: string; providerId: string } = {
       output: '', ok: false, error: 'No eligible provider could complete this run.', providerId: initialProvider.id
@@ -916,7 +1051,7 @@ export class OrchestrationEngine extends EventEmitter {
       const provider = this.settings.providers.find((item) => item.id === providerId)
       const runtime = this.runtimes.get(providerId)
       if (!provider || !runtime || controller.signal.aborted) break
-      if (providerId !== initialProvider.id && !rankProviders(routingTask, [{ ...provider, runtime }]).length) continue
+      if (providerId !== initialProvider.id && !rankProviders(routingTask, [{ ...provider, runtime }], this.routingOptions()).length) continue
       runtime.running += 1
       this.selectTaskProvider(task, provider.id)
       const started = Date.now()
@@ -927,7 +1062,7 @@ export class OrchestrationEngine extends EventEmitter {
         onOutput: (text) => { output += text; onText?.(text) },
         onModel: (model) => { task.model = model; this.emitSnapshot() },
         onActivity: (event) => { task.activity = [...(task.activity ?? []), event].slice(-100); recordFileChange(task, event); this.emitSnapshot() },
-        onUsage: (usage) => { this.applyUsage(runtime, usage, task) },
+        onUsage: (usage) => { this.applyUsage(runtime, usage, task, task.model ?? provider.model) },
         onContext: (context) => { contextReported = true; this.applyContext(task, provider, context) },
         onSession: (session) => { this.applySession(runtime, session) },
         onSessionId: (sessionId) => { task.sessionId = sessionId; task.sessionProviderId = provider.id }
@@ -959,13 +1094,17 @@ export class OrchestrationEngine extends EventEmitter {
   // Rank providers for a task and keep the explanation on the task, so the UI
   // can show why this agent won and what disqualified the others.
   private route(task: ProxyTask): ReturnType<typeof routeTask>['ranked'] {
-    const { ranked, decision } = routeTask(task, this.snapshot().providers)
+    const { ranked, decision } = routeTask(task, this.snapshot().providers, this.routingOptions())
     task.routing = decision
     return ranked
   }
 
+  private routingOptions(): { learnFromOutcomes: boolean } {
+    return { learnFromOutcomes: this.settings.learnFromOutcomes !== false }
+  }
+
   private pickProvider(task: ProxyTask): ProviderConfig | undefined {
-    const ranked = rankProviders({ ...task, orchestrated: false }, this.snapshot().providers)
+    const ranked = rankProviders({ ...task, orchestrated: false }, this.snapshot().providers, this.routingOptions())
     return this.settings.providers.find((item) => item.id === ranked[0]?.id)
   }
 
@@ -996,10 +1135,21 @@ export class OrchestrationEngine extends EventEmitter {
     return { controlPlane, skills }
   }
 
-  private applyUsage(runtime: ProviderRuntime, usage: UsageSample, task?: ProxyTask): void {
+  private applyUsage(runtime: ProviderRuntime, usage: UsageSample, task?: ProxyTask, model?: string): void {
     runtime.usage.inputTokens += usage.inputTokens
     runtime.usage.outputTokens += usage.outputTokens
     runtime.usage.costUsd += usage.costUsd
+    // Only Claude reports cost. Without this flag a Codex-heavy day reads as
+    // "$0.00 spent" rather than "this CLI does not report cost".
+    if (usage.costUsd > 0) runtime.usage.costReported = true
+    // Attribute the reported tokens to the model that produced them, so a day
+    // can be broken down per model rather than only per CLI.
+    const models = runtime.usage.models ?? (runtime.usage.models = {})
+    const bucket = models[model?.trim() || 'unreported'] ??= { samples: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 }
+    bucket.samples += 1
+    bucket.inputTokens += usage.inputTokens
+    bucket.outputTokens += usage.outputTokens
+    bucket.costUsd += usage.costUsd
     // Record the CLI's real reported tokens on the task too, so per-task views
     // show actual usage instead of the crude character-count estimate.
     if (task) {
@@ -1082,23 +1232,100 @@ export class OrchestrationEngine extends EventEmitter {
     }
   }
 
+  // A finished day moves into history instead of being dropped, so the Usage
+  // view can chart a trend. Empty days are not kept: they say nothing and would
+  // pad the chart with zeroes for every provider the user never enabled.
   private rollUsageDays(): void {
     const current = today()
     for (const runtime of this.runtimes.values()) {
-      if (runtime.usage.date !== current) runtime.usage = blankUsage()
+      if (runtime.usage.date === current) continue
+      if (runtime.usage.tasks) runtime.history = [...(runtime.history ?? []), runtime.usage].slice(-USAGE_HISTORY_DAYS)
+      runtime.usage = blankUsage()
     }
+  }
+
+  // Which agent produced a branch, and how its checks went. Task subtasks and
+  // bench lanes carry the routing type; workspace turns contribute verification
+  // only, since a turn is addressed to a participant rather than routed.
+  private branchRecords(): Map<string, { providerId?: string; type?: TaskType; verification?: VerificationReport }> {
+    const records = new Map<string, { providerId?: string; type?: TaskType; verification?: VerificationReport }>()
+    for (const task of this.tasks) {
+      for (const subtask of task.subtasks ?? []) {
+        if (subtask.branch) records.set(branchKey(task.cwd, subtask.branch), { providerId: subtask.providerId, type: subtask.type, verification: subtask.verification })
+      }
+    }
+    for (const workspace of this.workspaces) {
+      for (const turn of workspace.turns) {
+        if (turn.branch) records.set(branchKey(workspace.cwd, turn.branch), { providerId: turn.providerId, verification: turn.verification })
+      }
+    }
+    return records
+  }
+
+  private recordOutcome(providerId: string | undefined, type: TaskType, patch: Partial<OutcomeStats>): void {
+    const runtime = providerId ? this.runtimes.get(providerId) : undefined
+    if (!runtime) return
+    const outcomes = runtime.outcomes ?? (runtime.outcomes = {})
+    const stats = outcomes[type] ?? (outcomes[type] = blankOutcome())
+    for (const [key, value] of Object.entries(patch)) stats[key as keyof OutcomeStats] += value ?? 0
+  }
+
+  // A run that finished on its own is a data point; one the user cancelled is not
+  // a verdict on the agent, so it is never counted.
+  private recordRunOutcome(providerId: string | undefined, type: TaskType, status: ProxyTask['status'], verification?: VerificationReport): void {
+    if (status === 'cancelled') return
+    this.recordOutcome(providerId, type, {
+      runs: 1,
+      completed: status === 'completed' ? 1 : 0,
+      verified: verification?.ran && verification.ok ? 1 : 0,
+      verifyFailed: verification?.ran && !verification.ok ? 1 : 0
+    })
+  }
+
+  // Run the repo's own checks against a finished lane's worktree and measure what
+  // its branch actually contains. Only called once a lane has committed: verifying
+  // a run that changed nothing says nothing about the agent, and the repo's test
+  // suite is far too slow to run for a read-only answer.
+  private async verifyCommitted(cwd: string, workdir: string, branch: string, signal: AbortSignal): Promise<{ verification?: VerificationReport; files: number; additions: number; deletions: number }> {
+    const verification = await verifyWorktree(workdir, { ...this.settings.verification, signal }).catch(() => undefined)
+    const stats = await branchChangeStats(cwd, branch).catch(() => ({ files: 0, additions: 0, deletions: 0 }))
+    return { verification, ...stats }
+  }
+
+  private notifyFinished(task: ProxyTask): void {
+    if (task.status === 'completed' || task.status === 'failed') this.emit('task-finished', structuredClone(task))
   }
 
   private async persistAndEmit(): Promise<void> {
     const providerRuntime = Object.fromEntries([...this.runtimes].map(([providerId, runtime]) => [providerId, {
       usage: runtime.usage,
+      history: runtime.history,
+      outcomes: runtime.outcomes,
       sessions: runtime.sessions ?? (runtime.session ? [runtime.session] : undefined)
     }]))
     await this.store.save({ settings: this.settings, tasks: this.tasks.slice(0, 200), providerRuntime, workspaces: this.workspaces })
-    this.emitSnapshot()
+    this.emitSnapshot({ immediate: true })
   }
 
-  private emitSnapshot(): void {
-    this.emit('snapshot', this.snapshot())
+  // Coalesced by default: a streamed run calls this per token, and each call
+  // clones every task and workspace. State-changing paths pass `immediate` so a
+  // finished task, a settings edit, or a persist is never left waiting behind
+  // the timer.
+  private emitSnapshot(options: { immediate?: boolean } = {}): void {
+    const elapsed = Date.now() - this.lastSnapshotAt
+    if (options.immediate || elapsed >= SNAPSHOT_INTERVAL_MS) {
+      if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); this.snapshotTimer = undefined }
+      this.lastSnapshotAt = Date.now()
+      this.emit('snapshot', this.snapshot())
+      return
+    }
+    if (this.snapshotTimer) return
+    this.snapshotTimer = setTimeout(() => {
+      this.snapshotTimer = undefined
+      this.lastSnapshotAt = Date.now()
+      this.emit('snapshot', this.snapshot())
+    }, SNAPSHOT_INTERVAL_MS - elapsed)
+    // Never hold the process open for a snapshot.
+    this.snapshotTimer.unref?.()
   }
 }

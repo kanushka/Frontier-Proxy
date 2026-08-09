@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
-import { branchFileDiff, deleteTaskBranch, isTaskBranch, listBranchInbox, listRepoBranches, mergeTaskBranch } from '../src/main/branches'
+import { branchChangeStats, branchFileDiff, deleteTaskBranch, isTaskBranch, listBranchInbox, listRepoBranches, mergeTaskBranch } from '../src/main/branches'
 
 const run = promisify(execFile)
 const AUTHOR = ['-c', 'user.name=Frontier Tests', '-c', 'user.email=tests@frontier.local']
@@ -121,6 +121,32 @@ describe('task branch inbox', () => {
     const { cwd, branch } = await repoWithTaskBranch()
     await deleteTaskBranch(cwd, branch)
     expect(await listRepoBranches(cwd)).toBeUndefined()
+  })
+
+
+  // Verification results live on the task that produced the branch, not in git;
+  // the inbox joins them so a reviewer can see whether the branch is safe before
+  // opening a single diff.
+  it('joins each branch to the checks that ran against its worktree', async () => {
+    const { cwd, branch } = await repoWithTaskBranch()
+    const report = { ran: true, ok: false, at: new Date().toISOString(), checks: [{ name: 'test', command: 'pnpm run test', ok: false, exitCode: 1, durationMs: 12, output: 'boom' }] }
+    const [repo] = await listBranchInbox([cwd], (repoCwd, name) => (repoCwd === cwd && name === branch ? report : undefined))
+    expect(repo.branches[0].verification).toEqual(report)
+  })
+
+  it('leaves verification unset for a branch nothing reported on', async () => {
+    const { cwd } = await repoWithTaskBranch()
+    const [repo] = await listBranchInbox([cwd])
+    expect(repo.branches[0].verification).toBeUndefined()
+  })
+
+  it("totals a branch's change for the head-to-head scoreboard", async () => {
+    const { cwd, branch } = await repoWithTaskBranch()
+    const stats = await branchChangeStats(cwd, branch)
+    expect(stats.files).toBe(2)
+    expect(stats.additions).toBeGreaterThan(0)
+    // A branch outside frontier/ is never measured, same as it is never merged.
+    expect(await branchChangeStats(cwd, 'main')).toEqual({ files: 0, additions: 0, deletions: 0 })
   })
 
   // The inbox must never be able to touch a branch the user made themselves.

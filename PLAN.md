@@ -68,17 +68,68 @@ Data source: each CLI's stream. Claude emits real `usage` (input/output/cache to
   ⌘N new task), and a full command palette for navigation, common actions, and task lookup.
 - Future: provider cards showing real CLI auth + MCP status, deeper theming.
 
+### Verification lane ✅
+Every isolated run already left behind a branch nobody had read. The repo's **own** checks
+(detected from `package.json` scripts / `Makefile` / `Cargo.toml` / `go.mod`, or configured
+explicitly) now run against each worktree before teardown, and the result rides along to:
+- **Review** — a pass/fail chip per branch plus a per-check panel with the captured output,
+  so the inbox is "merge what passed" rather than "read a diff and hope".
+- **Compare** — the scoreboard is now measured: checks, files touched, ±lines, wall time,
+  tokens per lane. Still no judge model; every column is something Frontier observed.
+- **Workspaces** — `edit-files` turns are checked the same way.
+A branch with no detected checks reports "none detected", never a pass. A failing check
+never fails the agent's run, and never blocks the merge button.
+
+### Outcome-aware routing ✅
+The Review inbox is the only place a human grades an agent, and that verdict was being
+thrown away. Providers now accumulate per-task-type outcomes (completed, checks passed,
+branch merged vs discarded) and the router folds them into one labelled, bounded (±14)
+factor that appears on the Route tab like every other. Off by a single setting; silent
+below three runs; cancellations are never counted.
+
+### Usage history, per-model attribution, honest cost ✅
+Daily totals move into a 30-day `history` at the rollover instead of being discarded, and
+the Usage card charts them. Reported tokens are attributed per model. Cost now reads "not
+reported" for the CLIs that report none, instead of showing a misleading `$0.00`.
+
+### Provider login state ✅
+"Ready" only ever meant the binary existed. Each provider card now also shows a signed-in /
+signed-out chip, read read-only from that CLI's own on-disk session, reporting signed-out
+only on positive evidence (Copilot's empty `loggedInUsers` being the documented case).
+
+### Completion notifications ✅
+Runs take minutes. A finished or failed task raises an OS notification, by default only
+when Frontier is not focused.
+
+### Snapshot coalescing ✅
+Streaming cloned every task and workspace per token. Snapshots are now coalesced on a
+~60 ms trailing timer, with state changes flushing immediately; live text is untouched
+because it travels on its own channel.
+
 ## Remaining work
 
-1. **Usage history and per-model breakdowns** — persist daily history beyond the current
-   day, chart it, and attribute reported usage/cost to individual models.
-2. **Provider authentication diagnostics** — distinguish “executable detected” from a
-   valid Codex/Claude/Copilot login, and summarize each provider's active MCP servers.
-3. **Provider stream compatibility fixtures** — validate Codex and Copilot parsing against
+1. **Task templates & recipes** — save prompt + mode + agent + model + skills + cwd, run it
+   from the ⌘K palette. Nothing in the app currently remembers a run's shape.
+2. **Scheduled and git-triggered runs** — templates on a schedule, or when a branch moves.
+   Honest scope: only while the app is open, no daemon.
+3. **Push / open PR through the user's own `gh`** — the Review inbox dead-ends at a local
+   merge. Delegating the handoff to an already-authenticated CLI is the same principle as
+   delegating the models.
+4. **Quota forecasting** — project the burn rate against the reported window and offer to
+   shift the queue to a local model before the cap lands, instead of only reporting it.
+5. **Context compaction before a continuation overflows** — `contextTokens/contextWindow`
+   are tracked but purely informational today.
+6. **MCP "test connection"** — servers are configured and translated but never verified, so
+   a typo surfaces as a mysterious task failure much later.
+7. **Run isolated for ordinary tasks** — worktree isolation is currently a privilege of
+   orchestrate/bench/workspace turns; a plain task writes straight into the cwd.
+8. **Run report export** — markdown/HTML of a task (prompt, route receipt, activity, diff,
+   cost); doubles as a PR description.
+9. **Provider stream compatibility fixtures** — validate Codex and Copilot parsing against
    captured events from current CLI releases; consume exact Codex context occupancy if its
    JSON stream adds it.
-4. **Theme/accessibility polish** — deeper theming, responsive behavior below the current
-   desktop minimum width, and a dedicated keyboard/accessibility pass.
+10. **Theme/accessibility polish** — deeper theming, responsive behavior below the current
+    desktop minimum width, and a dedicated keyboard/accessibility pass.
 
 ## GitHub Copilot CLI — extensible surfaces worth mirroring
 From `copilot --help` (v1.0.73):

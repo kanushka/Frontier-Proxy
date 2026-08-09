@@ -23,7 +23,7 @@ const api: FrontierApi = {
   updateProvider: (patch: ProviderPatch) => ipcRenderer.invoke('frontier:update-provider', patch) as Promise<AppSnapshot>,
   addCustomProvider: () => ipcRenderer.invoke('frontier:add-custom-provider') as Promise<AppSnapshot>,
   removeProvider: (providerId: string) => ipcRenderer.invoke('frontier:remove-provider', providerId) as Promise<AppSnapshot>,
-  updateSettings: (changes: Partial<Pick<AppSettings, 'maxParallelTasks' | 'quotaCooldownMinutes' | 'memory' | 'skills'>>) =>
+  updateSettings: (changes: Partial<Pick<AppSettings, 'maxParallelTasks' | 'quotaCooldownMinutes' | 'memory' | 'skills' | 'verification' | 'notifications' | 'learnFromOutcomes'>>) =>
     ipcRenderer.invoke('frontier:update-settings', changes) as Promise<AppSnapshot>,
   updateControlPlane: (profile: ControlPlaneProfile) =>
     ipcRenderer.invoke('frontier:update-control-plane', profile) as Promise<AppSnapshot>,

@@ -5,6 +5,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   quotaCooldownMinutes: 20,
   memory: '',
   skills: { disabledIds: [] },
+  // Isolated runs already produce a branch nobody has reviewed; running the
+  // repo's own checks against it is what makes that branch decidable.
+  verification: { enabled: true, commands: [], timeoutSeconds: 300 },
+  notifications: { enabled: true, onlyWhenUnfocused: true },
+  learnFromOutcomes: true,
   controlPlane: {
     systemPrompt: '',
     addDirs: [],

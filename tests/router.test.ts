@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { rankProviders, routeTask, type RoutableProvider } from '../src/main/router'
+import { outcomeFactor, rankProviders, routeTask, type RoutableProvider } from '../src/main/router'
 import type { ProviderKind, ProxyTask, TaskType } from '../src/shared/types'
 
 function provider(id: string, kind: ProviderKind, tasks = 0, available = true): RoutableProvider {
@@ -141,5 +141,67 @@ describe('model-aware routing', () => {
     value.modelOverrideProviderId = 'claude'
     const ranked = rankProviders(value, [provider('codex', 'codex'), provider('claude', 'claude')])
     expect(ranked.map((item) => item.id)).toEqual(['claude', 'codex'])
+  })
+})
+
+// --- Outcome-aware routing ---
+// The Review inbox already records the user's verdict on each agent's branch;
+// these tests pin down how much that verdict is allowed to move the ranking.
+
+function withOutcomes(id: string, outcomes: RoutableProvider['runtime']['outcomes']): RoutableProvider {
+  const value = provider(id, 'claude')
+  value.runtime.outcomes = outcomes
+  return value
+}
+
+describe('outcome-aware routing', () => {
+  it('says nothing until there are enough runs to mean anything', () => {
+    expect(outcomeFactor({ runs: 2, completed: 2, merged: 2, discarded: 0, verified: 2, verifyFailed: 0 }, 'coding')).toBeUndefined()
+    expect(outcomeFactor(undefined, 'coding')).toBeUndefined()
+  })
+
+  it('rewards an agent whose branches get merged and whose checks pass', () => {
+    const factor = outcomeFactor({ runs: 8, completed: 8, merged: 6, discarded: 0, verified: 6, verifyFailed: 0 }, 'coding')
+    expect(factor?.points).toBeGreaterThan(0)
+    expect(factor?.label).toContain('8 runs')
+  })
+
+  it('penalizes an agent whose work keeps being thrown away', () => {
+    const factor = outcomeFactor({ runs: 8, completed: 6, merged: 0, discarded: 6, verified: 1, verifyFailed: 5 }, 'coding')
+    expect(factor?.points).toBeLessThan(0)
+  })
+
+  // A learned signal must never be able to overrule configured priority, a mode
+  // policy, or an explicit pick — so it stays inside a fixed band.
+  it('never exceeds the bounded band in either direction', () => {
+    const best = outcomeFactor({ runs: 100, completed: 100, merged: 100, discarded: 0, verified: 100, verifyFailed: 0 }, 'coding')
+    const worst = outcomeFactor({ runs: 100, completed: 0, merged: 0, discarded: 100, verified: 0, verifyFailed: 100 }, 'coding')
+    expect(best?.points).toBeLessThanOrEqual(14)
+    expect(worst?.points).toBeGreaterThanOrEqual(-14)
+  })
+
+  it('reorders two otherwise identical agents, and shows why on the decision', () => {
+    const good = withOutcomes('trusted', { coding: { runs: 10, completed: 10, merged: 8, discarded: 0, verified: 8, verifyFailed: 0 } })
+    const bad = withOutcomes('rejected', { coding: { runs: 10, completed: 8, merged: 0, discarded: 8, verified: 0, verifyFailed: 8 } })
+    const { ranked, decision } = routeTask(task('balanced', 'coding'), [bad, good])
+    expect(ranked[0].id).toBe('trusted')
+    expect(decision.candidates.find((candidate) => candidate.providerId === 'trusted')?.factors?.some((factor) => factor.label.includes('outcomes'))).toBe(true)
+  })
+
+  it('scores exactly as before when outcome learning is turned off', () => {
+    const good = withOutcomes('trusted', { coding: { runs: 10, completed: 10, merged: 8, discarded: 0, verified: 8, verifyFailed: 0 } })
+    const plain = provider('plain', 'claude')
+    const [withLearning] = routeTask(task('balanced', 'coding'), [good], { learnFromOutcomes: true }).decision.candidates
+    const [without] = routeTask(task('balanced', 'coding'), [good], { learnFromOutcomes: false }).decision.candidates
+    expect(withLearning.score).toBeGreaterThan(without.score!)
+    expect(without.score).toBe(routeTask(task('balanced', 'coding'), [plain]).decision.candidates[0].score)
+  })
+
+  // Outcomes are recorded per task type: being good at review says nothing about
+  // being good at debugging.
+  it('only applies the outcomes recorded for the task type being routed', () => {
+    const value = withOutcomes('claude', { review: { runs: 10, completed: 10, merged: 10, discarded: 0, verified: 10, verifyFailed: 0 } })
+    const coding = routeTask(task('balanced', 'coding'), [value]).decision.candidates[0]
+    expect(coding.factors?.some((factor) => factor.label.includes('outcomes'))).toBe(false)
   })
 })

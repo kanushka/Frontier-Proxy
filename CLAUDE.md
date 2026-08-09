@@ -303,6 +303,62 @@ diffed, merged, or deleted (`assertTaskBranch`); merging is refused while the ch
 dirty; a conflicting merge is aborted and reported rather than left half-applied. Merge and
 delete are both behind an explicit confirmation dialog in the UI.
 
+Each branch also carries the **verification report** for the run that produced it. That
+report does not live in git, so `listBranchInbox(cwds, verificationFor?)` takes a lookup
+and the engine supplies it from `branchRecords()` (task subtasks + workspace turns, keyed
+by cwd+branch). `branches.ts` stays a pure git module that knows nothing about tasks.
+
+## Verification lane (`src/main/verify.ts`)
+
+Every isolated run — an orchestrated subtask, a bench lane, a workspace `edit-files` turn —
+already produced a branch nobody has read. Verification runs **the project's own** checks
+against that worktree before it is torn down, so the Review inbox can say whether a branch
+is safe to merge instead of only what it changed.
+
+- **Frontier never invents a command.** Checks come from the repo's manifests
+  (`package.json` scripts limited to `typecheck`/`lint`/`test`, then a `Makefile` target,
+  then `Cargo.toml` → `cargo test`, `go.mod` → `go test ./...`) or from
+  `AppSettings.verification.commands`, which replaces detection entirely. `build`, `start`,
+  `dev` and friends are deliberately excluded — a check must not serve traffic or publish.
+- Commands are spawned with `shell: false`, in the worktree, with a per-check timeout. The
+  detection helpers and the argv splitter are pure and unit-tested (`tests/verify.test.ts`).
+- **Only a run that committed is verified.** A read-only answer changed nothing, so running
+  the repo's suite for it would say nothing about the agent and cost minutes.
+- `VerificationReport.ran === false` means *no checks were detected*, which is **not**
+  passing. Keep that distinction in every surface: `ok` is false in that case, and the UI
+  says "no checks detected", never a green tick.
+- A failing check never fails the agent's run: "the agent finished" and "the repo's tests
+  pass" are separate verdicts, and the UI shows them separately. Merging is never blocked
+  on a check — the report is information for the person deciding.
+- Bench lanes additionally record `startedAt`/`finishedAt`, per-lane tokens, and the
+  branch's `filesTouched`/`additions`/`deletions` (`branchChangeStats`), which is what
+  turns `benchSummary` from a list into a measured scoreboard. Still no judge model.
+
+## Outcome-aware routing
+
+`ProviderRuntime.outcomes[taskType]` counts how a provider's runs of that kind of work
+actually turned out: `runs`/`completed`, `verified`/`verifyFailed` from the checks above,
+and `merged`/`discarded` from the Review inbox — the last being the only signal a human
+produced, so it is weighted highest. `outcomeFactor` (pure, unit-tested in
+`tests/router.test.ts`) folds them into **one labelled `RoutingFactor`**, bounded to
+±14 points and silent below 3 runs, so a learned preference nudges the ranking and can
+never overrule configured priority, mode policy, or an explicit pick. It stays visible on
+the task's Route tab like every other factor. `AppSettings.learnFromOutcomes` turns it off,
+and with it off the router scores exactly as it did before. Cancelling a task records
+nothing — that is the user's decision, not a verdict on the agent. Deleting a branch that
+was already merged is housekeeping, not a rejection.
+
+## Provider login state
+
+`checkProvider` only runs `<exe> --version`, which is why a provider can show **Ready** and
+still fail every task. `checkProviderAuth` additionally reads each CLI's own session state
+from disk, **read-only** — never a login command: Copilot's `~/.copilot/config.json`
+(`loggedInUsers` empty with a `lastLoggedInUser` is the documented expired session), Claude's
+`~/.claude/.credentials.json` or the `oauthAccount` record in `~/.claude.json` (macOS keeps
+the secret in the keychain), Codex's `~/.codex/auth.json`. It reports `logged-out` **only on
+positive evidence**; anything unreadable stays `unknown` rather than accusing a working CLI.
+Ollama-backed and custom providers have no account and return nothing.
+
 ## Conversations (multi-turn continuation)
 
 Every task is a conversation (`task.turns: ConversationTurn[]`), not a one-shot. The
@@ -324,6 +380,11 @@ even when that CLI has no resumable session id.
 
 ## Layout, context window & memory
 
+- **Snapshot coalescing** — a streamed run touches task state per token, and `snapshot()`
+  `structuredClone`s every task and workspace. `emitSnapshot()` therefore coalesces on a
+  ~60 ms trailing timer; state-changing paths (`persistAndEmit`, task completion) pass
+  `{ immediate: true }`. Live text is unaffected: it arrives on the separate `stream`
+  channel, which is never throttled.
 - **Fixed app shell** — `body`/`.shell`/`main` are `height:100vh; overflow:hidden`; the
   Tasks view fills remaining height and its panels scroll independently (no full-page
   scroll). Other views scroll internally. A draggable `.grid-gutter` between the work
@@ -358,8 +419,15 @@ even when that CLI has no resumable session id.
 utilization). Codex `turn.completed` events contribute real token counts as well. The engine
 accumulates these into `runtime.usage` and stores every distinct plan window in
 `runtime.sessions` instead of overwriting one window with another. `JsonStore` persists
-the current day's usage and reported windows in `providerRuntime`; stale daily totals are
-discarded at the next local-date rollover.
+the current day's usage, up to 30 completed days of `history`, the reported windows, and
+`outcomes` in `providerRuntime`. At the local-date rollover a finished day **moves into
+`history`** instead of being discarded (empty days are dropped), so the Usage view charts a
+trend rather than only today. Reported tokens are also attributed per model
+(`UsageDay.models`), because a CLI can switch models mid-plan.
+
+**Cost is Claude-only.** Nothing else reports a figure, so `UsageDay.costReported` records
+whether any cost was ever reported and the UI shows "not reported" instead of `$0.00` — a
+Codex-heavy day must not read as free.
 Context occupancy is deliberately task-scoped (`task.contextTokens/contextWindow`), shown on
 the task row and dedicated task workspace—not on provider Usage cards. A provider-level
 context-window value can still be configured as a fallback when its CLI does not report one.
@@ -467,6 +535,12 @@ site/           Astro marketing + docs site, deployed to GitHub Pages
 ```
 
 State persists to `frontier-state.json` in Electron's per-user `userData` dir.
+
+`src/main/verify.ts` holds the verification lane; `src/main/index.ts` owns the only
+Electron-specific piece of it — the completion `Notification`, driven by the engine's
+`task-finished` event so `engine.ts` still imports nothing from Electron and stays testable.
+`AppSettings.notifications` gates it (`onlyWhenUnfocused` by default: a task that finishes
+while you are watching does not need one).
 
 ## The website (`site/`)
 
