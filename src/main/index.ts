@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Notification, safeStorage, shell } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
@@ -8,7 +8,7 @@ import { McpAuthManager } from './mcp-auth'
 import { hydrateExecutablePath } from './env'
 import { WorkspaceRuntime } from './workspace'
 import { CliParticipantRunner } from './participants'
-import type { ChatContextItem, CreateTaskInput, ProviderPatch, SelectedImage, WorkspaceParticipant } from '../shared/types'
+import type { ChatContextItem, CreateTaskInput, ProviderPatch, ProxyTask, SelectedImage, WorkspaceParticipant } from '../shared/types'
 
 let engine: OrchestrationEngine
 let workspaceRuntime: WorkspaceRuntime
@@ -29,6 +29,24 @@ async function selectedImage(path: string, name = basename(path), id: string = r
 
 function broadcast(channel: string, payload: unknown): void {
   for (const window of BrowserWindow.getAllWindows()) window.webContents.send(channel, payload)
+}
+
+// Agent runs take minutes, so the useful moment to be told about one is after you
+// have tabbed away. Clicking the notification brings the app forward; the renderer
+// already opens the task from the queue.
+function notifyTaskFinished(task: ProxyTask, settings: { enabled: boolean; onlyWhenUnfocused: boolean }): void {
+  if (!settings.enabled || !Notification.isSupported()) return
+  if (settings.onlyWhenUnfocused && BrowserWindow.getAllWindows().some((window) => window.isFocused())) return
+  const title = task.status === 'completed' ? 'Task finished' : 'Task failed'
+  const summary = task.prompt.replace(/\s+/g, ' ').trim().slice(0, 120)
+  const notification = new Notification({ title, body: task.error ? `${summary}\n${task.error.slice(0, 120)}` : summary })
+  notification.on('click', () => {
+    const window = BrowserWindow.getAllWindows()[0]
+    if (!window) return
+    if (window.isMinimized()) window.restore()
+    window.focus()
+  })
+  notification.show()
 }
 
 function createWindow(): void {
@@ -192,6 +210,7 @@ app.whenReady().then(async () => {
   engine.on('snapshot', (snapshot) => broadcast('frontier:snapshot-changed', snapshot))
   engine.on('stream', (event) => broadcast('frontier:stream', event))
   engine.on('workspace-stream', (event) => broadcast('frontier:workspace-stream', event))
+  engine.on('task-finished', (task: ProxyTask) => notifyTaskFinished(task, engine.snapshot().settings.notifications))
 
   const participantRunner = new CliParticipantRunner({
     findProvider: (providerId) => engine.listProviders().find((item) => item.id === providerId),
@@ -207,7 +226,8 @@ app.whenReady().then(async () => {
     claimProviderSlot: (providerId) => engine.claimProviderSlot(providerId),
     releaseProviderSlot: (providerId) => engine.releaseProviderSlot(providerId),
     persist: () => engine.persistWorkspaces(workspaceRuntime.list(), workspaceRuntime.snapshot()),
-    emitStream: (event) => engine.emitWorkspaceStream(event)
+    emitStream: (event) => engine.emitWorkspaceStream(event),
+    verify: (workdir, signal) => engine.verifyRunWorktree(workdir, signal)
   }, engine.loadedWorkspaces())
   // Publish the loaded workspaces into the snapshot straight away. The engine serves
   // `workspacesView` to the renderer, and only a mutation used to populate it — so

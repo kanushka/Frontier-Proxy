@@ -1,4 +1,4 @@
-import type { ProviderConfig, ProviderRuntime, ProxyTask, RoutingCandidate, RoutingDecision, RoutingFactor, TaskType } from '../shared/types'
+import type { OutcomeStats, ProviderConfig, ProviderRuntime, ProxyTask, RoutingCandidate, RoutingDecision, RoutingFactor, TaskType } from '../shared/types'
 import { activeSessions, sessionBlocked } from '../shared/sessions'
 
 export interface RoutableProvider extends ProviderConfig {
@@ -42,9 +42,36 @@ function skipReason(task: ProxyTask, provider: RoutableProvider, now: number): s
   return undefined
 }
 
+// How well this provider's recent runs of this kind of work actually went. Three
+// signals, strongest last: did the run finish, did the repo's own checks pass,
+// and did the user merge the branch it produced or throw it away. The merge
+// verdict is weighted highest because it is the only one a human made.
+//
+// Deliberately bounded to ±MAX_OUTCOME_POINTS and gated behind a minimum sample
+// count: this nudges the ranking, it never overrides configured priority, mode
+// policy, or an explicit choice — and it stays visible as one labelled factor.
+const MIN_OUTCOME_RUNS = 3
+const MAX_OUTCOME_POINTS = 14
+
+export function outcomeFactor(stats: OutcomeStats | undefined, taskType: TaskType): RoutingFactor | undefined {
+  if (!stats || stats.runs < MIN_OUTCOME_RUNS) return undefined
+  const completion = stats.completed / stats.runs
+  const reviewed = stats.merged + stats.discarded
+  const checked = stats.verified + stats.verifyFailed
+  // Each ratio is centred on 0 so "no better than a coin toss" scores nothing.
+  const parts = [{ weight: 1, ratio: completion }]
+  if (checked) parts.push({ weight: 1.5, ratio: stats.verified / checked })
+  if (reviewed) parts.push({ weight: 2.5, ratio: stats.merged / reviewed })
+  const weight = parts.reduce((total, part) => total + part.weight, 0)
+  const score = parts.reduce((total, part) => total + part.weight * (part.ratio - 0.5), 0) / weight
+  const points = Math.round(score * 2 * MAX_OUTCOME_POINTS)
+  if (!points) return undefined
+  return { label: `Recent ${taskType} outcomes (${stats.runs} runs)`, points }
+}
+
 // The score breakdown, kept as labelled parts so the UI can show exactly why a
 // provider won. The sum is the score the router actually sorts on.
-function scoreFactors(task: ProxyTask, provider: RoutableProvider): RoutingFactor[] {
+function scoreFactors(task: ProxyTask, provider: RoutableProvider, learnFromOutcomes: boolean): RoutingFactor[] {
   const factors: RoutingFactor[] = [{ label: 'Configured priority', points: provider.priority }]
   const affinityPoints = affinity[task.type][provider.kind] ?? 0
   if (affinityPoints) factors.push({ label: `${task.type} affinity`, points: affinityPoints })
@@ -62,6 +89,8 @@ function scoreFactors(task: ProxyTask, provider: RoutableProvider): RoutingFacto
   const usagePenalty = Math.min(25, utilization * 20)
   if (usagePenalty) factors.push({ label: 'Spreading usage across subscriptions', points: -usagePenalty })
   if (provider.runtime.running) factors.push({ label: 'Currently busy', points: -provider.runtime.running * 30 })
+  const outcome = learnFromOutcomes ? outcomeFactor(provider.runtime.outcomes?.[task.type], task.type) : undefined
+  if (outcome) factors.push(outcome)
   return factors
 }
 
@@ -71,10 +100,13 @@ function total(factors: RoutingFactor[]): number {
 
 // One pass produces both the ranking the engine acts on and the explanation the
 // UI shows, so a routing receipt can never drift from the real decision.
-export function routeTask(task: ProxyTask, providers: RoutableProvider[], now = Date.now()): { ranked: RoutableProvider[]; decision: RoutingDecision } {
+export interface RoutingOptions { now?: number; learnFromOutcomes?: boolean }
+
+export function routeTask(task: ProxyTask, providers: RoutableProvider[], options: RoutingOptions = {}): { ranked: RoutableProvider[]; decision: RoutingDecision } {
+  const now = options.now ?? Date.now()
   const evaluated = providers.map((provider) => {
     const reason = skipReason(task, provider, now)
-    const factors = reason ? undefined : scoreFactors(task, provider)
+    const factors = reason ? undefined : scoreFactors(task, provider, options.learnFromOutcomes !== false)
     return { provider, reason, factors, score: factors ? total(factors) : undefined }
   })
   const ranked = evaluated
@@ -92,6 +124,6 @@ export function routeTask(task: ProxyTask, providers: RoutableProvider[], now = 
   }
 }
 
-export function rankProviders(task: ProxyTask, providers: RoutableProvider[], now = Date.now()): RoutableProvider[] {
-  return routeTask(task, providers, now).ranked
+export function rankProviders(task: ProxyTask, providers: RoutableProvider[], options: RoutingOptions = {}): RoutableProvider[] {
+  return routeTask(task, providers, options).ranked
 }

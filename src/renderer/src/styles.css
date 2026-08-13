@@ -720,3 +720,39 @@ dialog::backdrop { background: rgba(0,0,0,.69); backdrop-filter: blur(4px); }
   .run-modes { grid-template-columns: 1fr; }
   .settings-grid { grid-template-columns: 1fr; }
 }
+
+/* --- Verification: checks run against an isolated branch --- */
+.check-chip { border-radius: 20px; padding: 2px 7px; font-size: 8px; letter-spacing: .5px; text-transform: uppercase; white-space: nowrap; border: 1px solid var(--line); color: var(--muted); }
+.check-chip.pass { border-color: rgba(169,239,114,.32); color: var(--green); }
+.check-chip.fail { border-color: rgba(251,141,136,.34); color: var(--red); }
+.check-dot { width: 6px; height: 6px; border-radius: 100%; background: var(--muted); flex: 0 0 auto; }
+.check-dot.pass { background: var(--green); }
+.check-dot.fail { background: var(--red); }
+
+.review-checks { border-bottom: 1px solid var(--line-soft); padding: 12px 18px; display: flex; flex-direction: column; gap: 7px; }
+.review-checks-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 11px; }
+.review-checks-empty { color: var(--muted); font-size: 10px; line-height: 1.55; }
+.review-check summary { display: flex; align-items: center; gap: 9px; cursor: pointer; font-size: 10px; padding: 4px 0; list-style: none; }
+.review-check summary::-webkit-details-marker { display: none; }
+.review-check summary code { font: 9px/1.4 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-check-meta { margin-left: auto; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.review-check-output { margin: 4px 0 8px; padding: 9px 11px; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--line-soft); border-radius: 7px; font: 10px/1.5 var(--mono); color: var(--muted); white-space: pre-wrap; }
+
+/* Head-to-head measurements on a bench/subtask lane. */
+.lane-score { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; padding: 8px 12px 0; }
+.lane-measure { border: 1px solid var(--line); border-radius: 20px; padding: 2px 7px; color: var(--muted); font-size: 8px; white-space: nowrap; }
+
+/* Login state, distinct from "the binary was found". */
+.auth-chip { display: inline-block; margin-top: 4px; border-radius: 20px; padding: 1px 6px; font-size: 8px; letter-spacing: .5px; text-transform: uppercase; border: 1px solid var(--line); color: var(--muted); }
+.auth-chip.logged-in { border-color: rgba(169,239,114,.3); color: var(--green); }
+.auth-chip.logged-out { border-color: rgba(251,141,136,.34); color: var(--red); }
+
+/* Usage history + per-model breakdown. */
+.usage-section-label { font-size: 8px; letter-spacing: .7px; text-transform: uppercase; color: var(--muted); margin-bottom: 7px; }
+.usage-history-chart { display: flex; align-items: flex-end; gap: 3px; height: 46px; }
+.usage-history-bar { flex: 1 1 0; height: 100%; display: flex; align-items: flex-end; }
+.usage-history-fill { width: 100%; border-radius: 2px 2px 0 0; background: rgba(141,189,234,.32); }
+.usage-history-bar.today .usage-history-fill { background: var(--green); }
+.usage-model-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: 10px; }
+.usage-model-name { font-family: var(--mono); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-model-tokens { color: var(--muted); font-size: 9px; white-space: nowrap; }

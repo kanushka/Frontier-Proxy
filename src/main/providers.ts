@@ -1,6 +1,9 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
+import { readFile, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import spawn from 'cross-spawn'
-import type { ActivityEvent, ContextSample, ControlPlaneProfile, ProviderConfig, ResolvedSkill, SessionInfo, UsageSample } from '../shared/types'
+import type { ActivityEvent, AuthState, AuthStatus, ContextSample, ControlPlaneProfile, ProviderConfig, ResolvedSkill, SessionInfo, UsageSample } from '../shared/types'
 import { parseLimitWindow, windowLabelFromMinutes } from '../shared/sessions'
 import { controlPlaneInjection } from './controlplane'
 
@@ -542,6 +545,57 @@ export async function checkProvider(provider: ProviderConfig): Promise<{ availab
   if (!primary.available || provider.kind !== 'codex-oss') return primary
   const ollama = await checkCommand('ollama', ['list'])
   return { available: ollama.available, version: primary.version }
+}
+
+// ---- Login state ----
+// `<exe> --version` only proves the binary exists, which is why a provider can
+// show "Ready" and still fail every task with "No authentication information
+// found". These probes read each CLI's own session state from disk, read-only,
+// and never run a login command. They only ever report `logged-out` on positive
+// evidence: a CLI whose state cannot be read stays `unknown` rather than being
+// accused of being signed out.
+
+export interface AuthProbe { state: AuthState; detail?: string }
+
+// Copilot keeps its session in `~/.copilot/config.json`. An empty
+// `loggedInUsers` with a `lastLoggedInUser` present is the documented expired
+// session — the exact case that produces headless failures.
+export function copilotAuthFromConfig(raw: string): AuthProbe {
+  let parsed: { loggedInUsers?: unknown; lastLoggedInUser?: unknown }
+  try { parsed = JSON.parse(raw) as typeof parsed } catch { return { state: 'unknown' } }
+  const users = parsed.loggedInUsers
+  if (!Array.isArray(users)) return { state: 'unknown' }
+  if (users.length) return { state: 'logged-in', detail: typeof users[0] === 'string' ? `Signed in as ${users[0]}` : undefined }
+  const last = typeof parsed.lastLoggedInUser === 'string' ? parsed.lastLoggedInUser : undefined
+  return { state: 'logged-out', detail: `${last ? `${last}'s session has expired. ` : ''}Run \`copilot login\`.` }
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try { return (await stat(path)).isFile() } catch { return false }
+}
+
+async function claudeAuth(home: string): Promise<AuthProbe> {
+  // Linux/Windows keep a credentials file; macOS uses the keychain and leaves
+  // only the account record in `~/.claude.json`, so either is evidence enough.
+  if (await fileExists(join(home, '.claude', '.credentials.json'))) return { state: 'logged-in' }
+  try {
+    const parsed = JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')) as { oauthAccount?: { emailAddress?: unknown } }
+    const email = parsed.oauthAccount?.emailAddress
+    if (parsed.oauthAccount) return { state: 'logged-in', detail: typeof email === 'string' ? `Signed in as ${email}` : undefined }
+  } catch { /* fall through to unknown */ }
+  return { state: 'unknown' }
+}
+
+export async function checkProviderAuth(provider: ProviderConfig, home = homedir()): Promise<AuthStatus | undefined> {
+  // Ollama-backed and custom CLIs have no account to be signed out of.
+  if (provider.kind === 'ollama' || provider.kind === 'codex-oss' || provider.kind === 'custom') return undefined
+  const checkedAt = new Date().toISOString()
+  if (provider.kind === 'copilot') {
+    const raw = await readFile(join(home, '.copilot', 'config.json'), 'utf8').catch(() => undefined)
+    return { ...(raw === undefined ? { state: 'unknown' as const } : copilotAuthFromConfig(raw)), checkedAt }
+  }
+  if (provider.kind === 'claude') return { ...(await claudeAuth(home)), checkedAt }
+  return { state: (await fileExists(join(home, '.codex', 'auth.json'))) ? 'logged-in' : 'unknown', checkedAt }
 }
 
 // Curated known models per subscription CLI. These CLIs have no headless

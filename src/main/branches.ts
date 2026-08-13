@@ -1,7 +1,12 @@
 import { execFile } from 'node:child_process'
 import { basename } from 'node:path'
 import { promisify } from 'node:util'
-import type { BranchFileChange, BranchRepo, TaskBranch } from '../shared/types'
+import type { BranchFileChange, BranchRepo, TaskBranch, VerificationReport } from '../shared/types'
+
+// Verification results live on the task/turn that produced a branch, not in git.
+// The inbox joins them on the branch name through this lookup so `branches.ts`
+// stays a pure git module with no knowledge of tasks or workspaces.
+export type VerificationLookup = (cwd: string, branch: string) => VerificationReport | undefined
 
 const run = promisify(execFile)
 const OPTIONS = { encoding: 'utf8' as const, timeout: 30_000, maxBuffer: 8_000_000 }
@@ -58,7 +63,19 @@ async function branchFiles(cwd: string, branch: string): Promise<BranchFileChang
   return files
 }
 
-export async function listRepoBranches(cwd: string): Promise<BranchRepo | undefined> {
+// Totals for one branch, measured the same way the inbox measures it (from the
+// merge base with HEAD), for the head-to-head scoreboard.
+export async function branchChangeStats(cwd: string, branch: string): Promise<{ files: number; additions: number; deletions: number }> {
+  if (!isTaskBranch(branch)) return { files: 0, additions: 0, deletions: 0 }
+  const files = await branchFiles(cwd, branch)
+  return {
+    files: files.length,
+    additions: files.reduce((total, file) => total + file.additions, 0),
+    deletions: files.reduce((total, file) => total + file.deletions, 0)
+  }
+}
+
+export async function listRepoBranches(cwd: string, verificationFor?: VerificationLookup): Promise<BranchRepo | undefined> {
   const inside = (await gitOrEmpty(cwd, ['rev-parse', '--is-inside-work-tree'])).trim()
   if (inside !== 'true') return undefined
 
@@ -86,16 +103,17 @@ export async function listRepoBranches(cwd: string): Promise<BranchRepo | undefi
       committedAt: committedAt || new Date().toISOString(),
       ahead,
       merged: merged.has(branch),
-      files: await branchFiles(cwd, branch)
+      files: await branchFiles(cwd, branch),
+      verification: verificationFor?.(cwd, branch)
     })
   }
   branches.sort((left, right) => right.committedAt.localeCompare(left.committedAt))
   return { cwd, name: basename(cwd) || cwd, currentBranch: currentBranch.trim() || 'HEAD', dirty: Boolean(status.trim()), branches }
 }
 
-export async function listBranchInbox(cwds: string[]): Promise<BranchRepo[]> {
+export async function listBranchInbox(cwds: string[], verificationFor?: VerificationLookup): Promise<BranchRepo[]> {
   const unique = [...new Set(cwds)]
-  const repos = await Promise.all(unique.map((cwd) => listRepoBranches(cwd).catch(() => undefined)))
+  const repos = await Promise.all(unique.map((cwd) => listRepoBranches(cwd, verificationFor).catch(() => undefined)))
   return repos.filter((repo): repo is BranchRepo => Boolean(repo))
     .sort((left, right) => left.name.localeCompare(right.name))
 }

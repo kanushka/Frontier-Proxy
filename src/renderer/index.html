@@ -279,6 +279,7 @@
                 </div>
                 <div id="review-branch-actions" class="review-branch-actions"></div>
               </header>
+              <div id="review-checks" class="review-checks" hidden></div>
               <div class="review-detail-body">
                 <aside id="review-files" class="review-files"></aside>
                 <div id="review-diff" class="task-file-code"></div>
@@ -374,6 +375,23 @@
               <div class="policy"><strong>Quality first</strong><span>Prefers Codex or Claude Code and only falls back when unavailable.</span></div>
               <div class="policy"><strong>Token saver</strong><span>Strongly favors Ollama-backed agents to preserve hosted usage.</span></div>
               <p class="field-help">Every task records the exact scores behind its decision — open its Route tab to see them.</p>
+            </section>
+            <section class="panel settings-card">
+              <p class="eyebrow">VERIFICATION</p><h2>Check isolated branches</h2>
+              <p class="field-help">After an agent finishes on its own branch — a split-and-delegate subtask, a comparison lane, or a workspace writing turn — Frontier runs this project's own checks against that worktree and reports the result in Review. Nothing is ever merged automatically.</p>
+              <label class="checkbox-row"><input id="verify-enabled" type="checkbox" /><span>Run checks on isolated branches</span></label>
+              <label>Commands (one per line, blank to auto-detect)<textarea id="verify-commands" rows="3" placeholder="pnpm test&#10;pnpm typecheck"></textarea></label>
+              <p class="field-help">Auto-detect reads <code>package.json</code> scripts (<code>typecheck</code>, <code>lint</code>, <code>test</code>), then a <code>Makefile</code>, <code>Cargo.toml</code>, or <code>go.mod</code>. Commands run with no shell, in the worktree only.</p>
+              <label>Timeout per check (seconds)<input id="verify-timeout" type="number" min="10" max="3600" /></label>
+              <button id="save-verification" class="primary-button">Save verification</button>
+            </section>
+            <section class="panel settings-card">
+              <p class="eyebrow">FEEDBACK</p><h2>Notifications &amp; learning</h2>
+              <label class="checkbox-row"><input id="notify-enabled" type="checkbox" /><span>Notify me when a task finishes</span></label>
+              <label class="checkbox-row"><input id="notify-unfocused" type="checkbox" /><span>Only when Frontier is not focused</span></label>
+              <label class="checkbox-row"><input id="learn-outcomes" type="checkbox" /><span>Let recent outcomes influence routing</span></label>
+              <p class="field-help">Outcome learning nudges the router with how each agent's recent runs of the same kind of work turned out — finished, passed the repo's checks, and above all whether you merged or discarded its branch. It is capped at ±14 points and always shown as a labelled factor on the task's Route tab.</p>
+              <button id="save-feedback" class="primary-button">Save preferences</button>
             </section>
             <section class="panel settings-card memory-card">
               <p class="eyebrow">FRONTIER MEMORY</p><h2>Persistent memory</h2>

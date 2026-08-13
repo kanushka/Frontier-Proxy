@@ -102,10 +102,65 @@ export interface SessionInfo {
   updatedAt: string
 }
 
+// One day's accumulated usage for a provider. The current day lives on
+// `ProviderRuntime.usage`; finished days are appended to `ProviderRuntime.history`
+// at the local-date rollover instead of being discarded.
+export interface UsageDay {
+  date: string
+  tasks: number
+  estimatedInputTokens: number
+  estimatedOutputTokens: number
+  // Actual tokens/cost reported by the provider (0 when the CLI reports none).
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+  elapsedMs: number
+  // Real usage attributed to the model that produced it, so a day's tokens can
+  // be broken down per model rather than only per CLI.
+  models?: Record<string, ModelUsage>
+  // Whether any cost figure was actually reported during this day. Only Claude
+  // reports cost today, so a 0 must never be shown as "this cost nothing".
+  costReported?: boolean
+}
+
+export interface ModelUsage {
+  // Usage reports received, not runs: a single run can report several times.
+  samples: number
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+}
+
+export type AuthState = 'logged-in' | 'logged-out' | 'unknown'
+
+// Whether the CLI is actually signed in, which `<exe> --version` cannot answer.
+// Only positive evidence is reported: a CLI whose login state cannot be read
+// stays `unknown` rather than being accused of being logged out.
+export interface AuthStatus {
+  state: AuthState
+  detail?: string
+  checkedAt: string
+}
+
+// How a provider's finished runs actually turned out, per task type. Fed back
+// into routing as one bounded, labelled factor — the merge/discard counts come
+// from the Review inbox, so the user's own verdict on an agent's branch is the
+// strongest signal here.
+export interface OutcomeStats {
+  runs: number
+  completed: number
+  merged: number
+  discarded: number
+  verified: number
+  verifyFailed: number
+}
+
 export interface ProviderRuntime {
   available: boolean
   version?: string
   lastCheckedAt?: string
+  // Real login state of the CLI, probed read-only from its own on-disk session.
+  auth?: AuthStatus
   running: number
   cooldownUntil?: string
   cooldownReason?: string
@@ -117,17 +172,12 @@ export interface ProviderRuntime {
   // Models this provider can run — discovered (`ollama list`) or a curated
   // known set for the subscription CLIs (no headless list command exists).
   models?: string[]
-  usage: {
-    date: string
-    tasks: number
-    estimatedInputTokens: number
-    estimatedOutputTokens: number
-    // Actual tokens/cost reported by the provider (0 when the CLI reports none).
-    inputTokens: number
-    outputTokens: number
-    costUsd: number
-    elapsedMs: number
-  }
+  usage: UsageDay
+  // Completed days, oldest first, so the Usage view can chart a trend instead of
+  // showing only today.
+  history?: UsageDay[]
+  // Per task type, how this provider's runs have actually turned out.
+  outcomes?: Partial<Record<TaskType, OutcomeStats>>
 }
 
 export interface TaskAttempt {
@@ -230,6 +280,37 @@ export interface RoutingDecision {
   candidates: RoutingCandidate[]
 }
 
+// One command run against a finished agent's worktree — the repo's own tests,
+// linter, or type checker. Frontier never invents a command: they are detected
+// from the project's manifests or configured explicitly.
+export interface VerificationCheck {
+  name: string
+  command: string
+  args: string[]
+}
+
+export interface VerificationResult {
+  name: string
+  // The command as it was actually run, for display.
+  command: string
+  ok: boolean
+  exitCode?: number
+  durationMs: number
+  // Tail of the combined output, capped — enough to see the failure.
+  output: string
+  timedOut?: boolean
+}
+
+// The verdict for one isolated run: every detected check, and whether they all
+// passed. `checks: []` with `ran: false` means nothing was detected to run,
+// which is not the same as passing.
+export interface VerificationReport {
+  ran: boolean
+  ok: boolean
+  checks: VerificationResult[]
+  at: string
+}
+
 export type OrchestrationStage = 'planning' | 'delegating' | 'synthesizing' | 'done'
 
 // One unit of work in an orchestrated task, dispatched to a best-fit provider.
@@ -246,6 +327,17 @@ export interface SubTask {
   // Isolation: the git branch this subtask's changes were committed to.
   branch?: string
   committed?: boolean
+  // Head-to-head measurements, filled in as the lane runs so the bench
+  // scoreboard reports what happened instead of only who finished.
+  startedAt?: string
+  finishedAt?: string
+  usageInputTokens?: number
+  usageOutputTokens?: number
+  additions?: number
+  deletions?: number
+  filesTouched?: number
+  // The repo's own checks, run in this lane's worktree before it was torn down.
+  verification?: VerificationReport
 }
 
 export interface ProxyTask {
@@ -325,6 +417,9 @@ export interface TaskBranch {
   ahead: number
   merged: boolean
   files: BranchFileChange[]
+  // Checks that ran in the worktree this branch came from, joined on the branch
+  // name. Absent for a branch whose run predates verification.
+  verification?: VerificationReport
 }
 
 export interface BranchRepo {
@@ -378,6 +473,23 @@ export interface SkillSettings {
   disabledIds: string[]
 }
 
+// Verification runs the project's own commands — never anything Frontier made
+// up — against an isolated worktree once its agent has finished.
+export interface VerificationSettings {
+  enabled: boolean
+  // Empty means "detect from the repo" (package.json scripts, Makefile, Cargo,
+  // Go). A non-empty list replaces detection entirely.
+  commands: string[]
+  timeoutSeconds: number
+}
+
+export interface NotificationSettings {
+  enabled: boolean
+  // Long runs are the point of notifying; a task that finishes while you are
+  // watching does not need one.
+  onlyWhenUnfocused: boolean
+}
+
 export interface AppSettings {
   providers: ProviderConfig[]
   maxParallelTasks: number
@@ -386,6 +498,11 @@ export interface AppSettings {
   // Frontier's own persistent memory, injected as context into every new task.
   memory: string
   skills: SkillSettings
+  verification: VerificationSettings
+  notifications: NotificationSettings
+  // Let a provider's recent outcomes influence routing. Off means the router
+  // scores exactly as it did before outcome tracking existed.
+  learnFromOutcomes: boolean
 }
 
 export interface AppSnapshot {
@@ -485,6 +602,8 @@ export interface WorkspaceTurn {
   branch?: string
   committed?: boolean
   filesChanged?: FileChange[]
+  // The repo's own checks, run in this turn's worktree (edit-files turns only).
+  verification?: VerificationReport
   startedAt?: string
   finishedAt?: string
 }
@@ -569,7 +688,7 @@ export interface FrontierApi {
   updateProvider(patch: ProviderPatch): Promise<AppSnapshot>
   addCustomProvider(): Promise<AppSnapshot>
   removeProvider(providerId: string): Promise<AppSnapshot>
-  updateSettings(changes: Partial<Pick<AppSettings, 'maxParallelTasks' | 'quotaCooldownMinutes' | 'memory' | 'skills'>>): Promise<AppSnapshot>
+  updateSettings(changes: Partial<Pick<AppSettings, 'maxParallelTasks' | 'quotaCooldownMinutes' | 'memory' | 'skills' | 'verification' | 'notifications' | 'learnFromOutcomes'>>): Promise<AppSnapshot>
   updateControlPlane(profile: ControlPlaneProfile): Promise<AppSnapshot>
   previewControlPlane(providerId: string, profile?: ControlPlaneProfile, options?: { cwd?: string; skillIds?: string[] }): Promise<string[]>
   listSkills(cwd: string, refresh?: boolean): Promise<SkillCatalog>
