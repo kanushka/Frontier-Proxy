@@ -1,5 +1,6 @@
 import type { OutcomeStats, ProviderConfig, ProviderRuntime, ProxyTask, RoutingCandidate, RoutingDecision, RoutingFactor, TaskType } from '../shared/types'
 import { activeSessions, sessionBlocked } from '../shared/sessions'
+import { efficiencyBaselines, efficiencyFactors, type EfficiencyBaselines } from './evidence'
 
 export interface RoutableProvider extends ProviderConfig {
   runtime: ProviderRuntime
@@ -71,7 +72,7 @@ export function outcomeFactor(stats: OutcomeStats | undefined, taskType: TaskTyp
 
 // The score breakdown, kept as labelled parts so the UI can show exactly why a
 // provider won. The sum is the score the router actually sorts on.
-function scoreFactors(task: ProxyTask, provider: RoutableProvider, learnFromOutcomes: boolean): RoutingFactor[] {
+function scoreFactors(task: ProxyTask, provider: RoutableProvider, learnFromOutcomes: boolean, baselines: EfficiencyBaselines): RoutingFactor[] {
   const factors: RoutingFactor[] = [{ label: 'Configured priority', points: provider.priority }]
   const affinityPoints = affinity[task.type][provider.kind] ?? 0
   if (affinityPoints) factors.push({ label: `${task.type} affinity`, points: affinityPoints })
@@ -89,8 +90,11 @@ function scoreFactors(task: ProxyTask, provider: RoutableProvider, learnFromOutc
   const usagePenalty = Math.min(25, utilization * 20)
   if (usagePenalty) factors.push({ label: 'Spreading usage across subscriptions', points: -usagePenalty })
   if (provider.runtime.running) factors.push({ label: 'Currently busy', points: -provider.runtime.running * 30 })
-  const outcome = learnFromOutcomes ? outcomeFactor(provider.runtime.outcomes?.[task.type], task.type) : undefined
-  if (outcome) factors.push(outcome)
+  if (learnFromOutcomes) {
+    const outcome = outcomeFactor(provider.runtime.outcomes?.[task.type], task.type)
+    if (outcome) factors.push(outcome)
+    factors.push(...efficiencyFactors(provider.runtime, baselines))
+  }
   return factors
 }
 
@@ -104,9 +108,11 @@ export interface RoutingOptions { now?: number; learnFromOutcomes?: boolean }
 
 export function routeTask(task: ProxyTask, providers: RoutableProvider[], options: RoutingOptions = {}): { ranked: RoutableProvider[]; decision: RoutingDecision } {
   const now = options.now ?? Date.now()
-  const evaluated = providers.map((provider) => {
-    const reason = skipReason(task, provider, now)
-    const factors = reason ? undefined : scoreFactors(task, provider, options.learnFromOutcomes !== false)
+  const preflight = providers.map((provider) => ({ provider, reason: skipReason(task, provider, now) }))
+  const eligible = preflight.filter((item) => !item.reason).map((item) => item.provider)
+  const baselines = options.learnFromOutcomes === false ? {} : efficiencyBaselines(eligible.map((provider) => provider.runtime))
+  const evaluated = preflight.map(({ provider, reason }) => {
+    const factors = reason ? undefined : scoreFactors(task, provider, options.learnFromOutcomes !== false, baselines)
     return { provider, reason, factors, score: factors ? total(factors) : undefined }
   })
   const ranked = evaluated
