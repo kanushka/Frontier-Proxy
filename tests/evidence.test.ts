@@ -28,7 +28,8 @@ describe('routing efficiency evidence', () => {
     yesterday.inputTokens = 2_000
     yesterday.outputTokens = 2_000
     const evidence = usageEvidence(runtime(day(2, 4_000, 12_000), [yesterday]))
-    expect(evidence).toEqual({ tasks: 4, avgTokens: 2_000, avgElapsedMs: 8_000 })
+    // Wall time spans every day; tokens average only over the days that reported.
+    expect(evidence).toEqual({ tasks: 4, avgTokens: 2_000, tokensReported: true, avgElapsedMs: 8_000 })
   })
 
   it('rewards providers that use fewer tokens and less wall time than peers', () => {
@@ -52,5 +53,48 @@ describe('routing efficiency evidence', () => {
       ...efficiencyFactors(huge, efficiencyBaselines([tiny, huge]))
     ]
     expect(factors.every((factor) => Math.abs(factor.points) <= 6)).toBe(true)
+  })
+
+  // Claude and Codex stream real usage events; Copilot and Ollama stream none, so
+  // the engine falls back to estimating the prompt and the final text. Identical
+  // work therefore lands orders of magnitude apart, and comparing the two would
+  // score telemetry rather than efficiency — penalising exactly the CLIs that
+  // report honestly.
+  it('never ranks a CLI that reports real tokens against one that only estimates', () => {
+    const reports = runtime(day(10, 20_000, 900_000))
+    reports.usage.inputTokens = 1_800_000
+    reports.usage.outputTokens = 60_000
+    const estimatesOnly = runtime(day(10, 20_000, 900_000))
+
+    const baselines = efficiencyBaselines([reports, estimatesOnly])
+    const token = (rt: typeof reports) => efficiencyFactors(rt, baselines).find((factor) => factor.label.startsWith('Token efficiency'))
+    expect(token(reports)).toBeUndefined()
+    expect(token(estimatesOnly)).toBeUndefined()
+  })
+
+  it('still compares reported tokens against other reporting peers', () => {
+    const lean = runtime(day(10, 0, 900_000))
+    lean.usage.inputTokens = 200_000
+    const heavy = runtime(day(10, 0, 900_000))
+    heavy.usage.inputTokens = 2_000_000
+    const estimatesOnly = runtime(day(10, 20_000, 900_000))
+
+    const baselines = efficiencyBaselines([lean, heavy, estimatesOnly])
+    const token = (rt: typeof lean) => efficiencyFactors(rt, baselines).find((factor) => factor.label.startsWith('Token efficiency'))?.points
+    expect(token(lean)).toBeGreaterThan(0)
+    expect(token(heavy)).toBeLessThan(0)
+  })
+
+  // Wall time is measured by the engine for every run, so it stays comparable
+  // across CLIs that report nothing at all.
+  it('still compares wall time across CLIs that report no tokens', () => {
+    const quick = runtime(day(10, 20_000, 200_000))
+    quick.usage.inputTokens = 500_000
+    const slow = runtime(day(10, 20_000, 2_000_000))
+
+    const baselines = efficiencyBaselines([quick, slow])
+    const latency = (rt: typeof quick) => efficiencyFactors(rt, baselines).find((factor) => factor.label.startsWith('Latency efficiency'))?.points
+    expect(latency(quick)).toBeGreaterThan(0)
+    expect(latency(slow)).toBeLessThan(0)
   })
 })

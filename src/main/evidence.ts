@@ -11,29 +11,46 @@ const MAX_LATENCY_EFFICIENCY_POINTS = 5
 export interface UsageEvidence {
   tasks: number
   avgTokens?: number
+  // Which measurement `avgTokens` came from. Reported and estimated counts are
+  // different units, so this decides which peer group it may be compared with.
+  tokensReported: boolean
   avgElapsedMs?: number
 }
 
 export interface EfficiencyBaselines {
-  avgTokens?: number
+  reportedTokens?: number
+  estimatedTokens?: number
   avgElapsedMs?: number
 }
 
-function tokensForDay(day: UsageDay): number {
-  const reported = day.inputTokens + day.outputTokens
-  return reported || day.estimatedInputTokens + day.estimatedOutputTokens
+function reportedTokens(day: UsageDay): number {
+  return day.inputTokens + day.outputTokens
 }
 
+function estimatedTokens(day: UsageDay): number {
+  return day.estimatedInputTokens + day.estimatedOutputTokens
+}
+
+// Only the CLIs that stream usage events (Claude, Codex) report real tokens; the
+// rest leave Frontier's own estimate, which counts the prompt and the final text
+// and nothing else — no cache reads, no tool results, no intermediate turns. The
+// two land orders of magnitude apart for identical work, so a provider's tokens
+// are averaged over the days measured the same way and never mixed.
 export function usageEvidence(runtime: ProviderRuntime): UsageEvidence | undefined {
   const days = [...(runtime.history ?? []), runtime.usage].filter((day) => day.tasks > 0)
   const tasks = days.reduce((sum, day) => sum + day.tasks, 0)
   if (tasks < MIN_EFFICIENCY_TASKS) return undefined
 
-  const tokens = days.reduce((sum, day) => sum + tokensForDay(day), 0)
+  const reported = days.filter((day) => reportedTokens(day) > 0)
+  const measured = reported.length ? reported : days
+  const tokensFor = reported.length ? reportedTokens : estimatedTokens
+  const measuredTasks = measured.reduce((sum, day) => sum + day.tasks, 0)
+  const tokens = measured.reduce((sum, day) => sum + tokensFor(day), 0)
   const elapsedMs = days.reduce((sum, day) => sum + day.elapsedMs, 0)
   return {
     tasks,
-    avgTokens: tokens > 0 ? tokens / tasks : undefined,
+    avgTokens: tokens > 0 && measuredTasks > 0 ? tokens / measuredTasks : undefined,
+    tokensReported: reported.length > 0,
     avgElapsedMs: elapsedMs > 0 ? elapsedMs / tasks : undefined
   }
 }
@@ -45,10 +62,16 @@ function median(values: number[]): number | undefined {
   return ordered.length % 2 ? ordered[middle] : (ordered[middle - 1] + ordered[middle]) / 2
 }
 
+// Two token baselines, one per measurement, so a CLI is only ever ranked against
+// peers measured the same way. Wall time is recorded by the engine for every run,
+// so it needs no such split.
 export function efficiencyBaselines(runtimes: ProviderRuntime[]): EfficiencyBaselines {
   const evidence = runtimes.map(usageEvidence).filter((item): item is UsageEvidence => Boolean(item))
+  const tokensMeasured = (reported: boolean) =>
+    median(evidence.flatMap((item) => item.avgTokens !== undefined && item.tokensReported === reported ? [item.avgTokens] : []))
   return {
-    avgTokens: median(evidence.flatMap((item) => item.avgTokens === undefined ? [] : [item.avgTokens])),
+    reportedTokens: tokensMeasured(true),
+    estimatedTokens: tokensMeasured(false),
     avgElapsedMs: median(evidence.flatMap((item) => item.avgElapsedMs === undefined ? [] : [item.avgElapsedMs]))
   }
 }
@@ -64,7 +87,10 @@ export function efficiencyFactors(runtime: ProviderRuntime, baselines: Efficienc
   if (!evidence) return []
 
   const factors: RoutingFactor[] = []
-  const tokenPoints = relativePoints(evidence.avgTokens, baselines.avgTokens, MAX_TOKEN_EFFICIENCY_POINTS)
+  // A provider with nobody comparable to measure against scores nothing here —
+  // an unmeasured cost is not a low one.
+  const tokenBaseline = evidence.tokensReported ? baselines.reportedTokens : baselines.estimatedTokens
+  const tokenPoints = relativePoints(evidence.avgTokens, tokenBaseline, MAX_TOKEN_EFFICIENCY_POINTS)
   const latencyPoints = relativePoints(evidence.avgElapsedMs, baselines.avgElapsedMs, MAX_LATENCY_EFFICIENCY_POINTS)
   if (tokenPoints) factors.push({ label: `Token efficiency (${evidence.tasks} tasks)`, points: tokenPoints })
   if (latencyPoints) factors.push({ label: `Latency efficiency (${evidence.tasks} tasks)`, points: latencyPoints })
