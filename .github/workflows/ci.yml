@@ -1,0 +1,80 @@
+name: CI
+
+# The desktop pipeline in build.yml only validates pushes to main, tags, and
+# manual runs, so a pull request could previously be merged without its types or
+# tests ever having been checked. This is that gate. Pushes to main stay with
+# build.yml's own validate job rather than being duplicated here.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes the run already in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Typecheck & test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          # Nothing here launches Electron; skipping the binary keeps installs fast.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+      - name: Check types
+        run: pnpm typecheck
+
+      - name: Run tests
+        run: pnpm test
+
+  site:
+    name: Build site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      # site/ is deliberately outside the pnpm workspace and keeps its own
+      # lockfile, so it installs exactly as site.yml installs it.
+      - name: Install dependencies
+        working-directory: site
+        run: pnpm install --ignore-workspace --frozen-lockfile
+
+      # The site reads the repo and the releases API at build time, so a change
+      # to either can break it. Catch that here instead of at deploy, which only
+      # runs once the branch is already on main.
+      - name: Build
+        working-directory: site
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm build
